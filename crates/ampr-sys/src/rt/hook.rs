@@ -1910,6 +1910,17 @@ unsafe fn load_observe(
 }
 
 /// `ampr_install_libkernel_hooks_for_module`.
+/// Why hook `i` did not install at the last `install_all` (status file,
+/// rt/exports.rs): ABSENT, the symbol is not exported by this firmware;
+/// ALIAS, another name of a function already detoured (FreeBSD `_fstat` /
+/// `fstat`, `_openat` / `openat`): served through that name; FAILED, the
+/// detour itself failed (a prologue the decoder rejects, or the AIO set
+/// rolled back). Only FAILED loses coverage. Under HOOK_LOCK.
+pub(crate) const HOOK_NOTE_ABSENT: u8 = 1;
+pub(crate) const HOOK_NOTE_ALIAS: u8 = 2;
+pub(crate) const HOOK_NOTE_FAILED: u8 = 3;
+static HOOK_NOTE: SyncCell<[u8; HOOK_COUNT]> = SyncCell::new([0; HOOK_COUNT]);
+
 unsafe fn install_all(lib: SceKernelModule) -> c_int {
     let _g = HOOK_LOCK.lock();
     let st = unsafe { state() };
@@ -1950,6 +1961,16 @@ unsafe fn install_all(lib: SceKernelModule) -> c_int {
                     spec.replacement,
                 )
             };
+        let note = unsafe { &mut (*HOOK_NOTE.get())[i] };
+        *note = if ok {
+            0
+        } else if target.is_null() {
+            HOOK_NOTE_ABSENT
+        } else if alias {
+            HOOK_NOTE_ALIAS
+        } else {
+            HOOK_NOTE_FAILED
+        };
         if ok {
             installed += 1;
         } else if spec.mandatory {
@@ -1974,6 +1995,7 @@ unsafe fn install_all(lib: SceKernelModule) -> c_int {
             if unsafe { uninstall(&mut st.tramp, &mut st.hooks[i]) } && was {
                 unsafe { store_slot(lib_slot(i), SDK_FALLBACK.0[i]) };
                 installed -= 1;
+                unsafe { (*HOOK_NOTE.get())[i] = HOOK_NOTE_FAILED };
             }
         }
     }
@@ -2004,12 +2026,13 @@ unsafe fn install_all(lib: SceKernelModule) -> c_int {
 /// did not install, mandatory or optional. A missing optional hook used to
 /// leave no trace in the release build (a missing `read` hook leaves
 /// packed fds AIO-only, for one).
-pub(crate) unsafe fn for_each_missing_hook(mut f: impl FnMut(&'static core::ffi::CStr)) {
+/// `f(symbol, note)` with note HOOK_NOTE_* (0: unknown, e.g. never tried).
+pub(crate) unsafe fn for_each_missing_hook(mut f: impl FnMut(&'static core::ffi::CStr, u8)) {
     let _g = HOOK_LOCK.lock();
     let st = unsafe { state() };
     for i in 0..HOOK_COUNT {
         if hook_enabled(i) && !st.hooks[i].installed {
-            f(HOOKS.0[i].symbol);
+            f(HOOKS.0[i].symbol, unsafe { (*HOOK_NOTE.get())[i] });
         }
     }
 }

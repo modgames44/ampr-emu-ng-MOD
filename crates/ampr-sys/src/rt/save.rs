@@ -12,7 +12,10 @@
 //!   through sceSaveDataSaveIcon instead of a path inside it. The save
 //!   service runs outside the game's mount namespace, so it cannot open
 //!   /app0/images/icon0.png when that file is packed; the game then never
-//!   finishes saving. A loose path goes to the original call unchanged.
+//!   finishes saving. A loose path goes to the original call unchanged,
+//!   except that an /app0 icon the service cannot open (0x809f000e: the
+//!   install lacks the file) answers 0 too: the icon is cosmetic, and that
+//!   error made a title (Marvel's Wolverine, pkg mode) fail its saves.
 //!   The bytes are read by rt/pack/mmap.rs `read_packed` into transient
 //!   memory from the pool's Index ledger (rt/index_memory.rs), not a fixed
 //!   pool site.
@@ -31,6 +34,15 @@ use core::ffi::{c_char, c_int, c_void};
 
 /// SCE_SAVE_DATA_ERROR_BUSY: the save is mounted or in use.
 const SAVE_DATA_ERROR_BUSY: c_int = 0x809F_0003u32 as c_int;
+/// What sceSaveDataSaveIconByPath answers when the save service cannot open
+/// the icon path (a packed file, or a file the install lacks).
+const SAVE_ICON_UNREADABLE: c_int = 0x809F_000Eu32 as c_int;
+
+/// The icon path is the title's own (`/app0/...`): a file it ships, so its
+/// absence is the install's, never the game's choice.
+unsafe fn app0_path(path: *const c_char) -> bool {
+    unsafe { core::ffi::CStr::from_ptr(path) }.to_bytes().starts_with(b"/app0/")
+}
 
 /// `SceSaveDataIcon` as sceSaveDataSaveIcon reads it (live 13.00 native
 /// disassembly: it copies 0x38 bytes, pointer @0, buffer size @8, data size
@@ -116,7 +128,20 @@ pub unsafe extern "C" fn save_icon_by_path_emul(
     // 0: the service cannot open a packed path (0x809f000e), and that error
     // stalled a title's save; the icon is cosmetic.
     let rc = match unsafe { read_packed(path, |bytes| save_icon_bytes(mount_point, bytes)) } {
-        None => return unsafe { forward_icon_path(orig, mount_point, path) },
+        None => {
+            // A loose or missing file. An /app0 icon the install lacks (a
+            // pkg whose image has no sce_sys/save_data.png: the retail
+            // install takes it from the container) failed with 0x809f000e
+            // and the title reported the whole save as failed; the icon is
+            // cosmetic, so that answer becomes 0, as for a packed icon.
+            let rc = unsafe { forward_icon_path(orig, mount_point, path) };
+            if rc == SAVE_ICON_UNREADABLE && unsafe { app0_path(path) } {
+                stats::add(Stat::SaveIconSkipped, 1);
+                unsafe { note_icon(path, rc) };
+                return 0;
+            }
+            return rc;
+        }
         Some(Ok(Some((0, size)))) => {
             stats::add(Stat::SaveIconBytes, size as u64);
             0

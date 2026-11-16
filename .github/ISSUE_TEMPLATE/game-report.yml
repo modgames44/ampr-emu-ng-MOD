@@ -22,8 +22,8 @@ body:
     id: version
     attributes:
       label: ampr-emu-ng version
-      description: 'The launch notification shows it, e.g. "ampr-emu-ng: v0.5.2 (zstd) running" or, for a beta, "v0.5.2-beta.abc1234". For a test build, name the zip.'
-      placeholder: "v0.5.2"
+      description: 'The launch notification shows it, e.g. "ampr-emu-ng: v0.5.4 (zstd) running" or, for a beta, "v0.5.4-beta.abc1234". For a test build, name the zip.'
+      placeholder: "v0.5.4"
     validations:
       required: true
 

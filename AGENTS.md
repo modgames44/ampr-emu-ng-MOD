@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Notes for coding agents working on ampr-emu-ng (version 0.5.2, GPL-3.0-or-later; upstream base 0.4.1).
+Notes for coding agents working on ampr-emu-ng (version 0.5.4, GPL-3.0-or-later; upstream base 0.4.1).
 
 ## Project
 
@@ -124,7 +124,9 @@ exist only in the debug build, as pass-through probes in titles with packs
 (`rt/probe.rs`). Pkg mode and a writable /app0 add no hook ids.
 At module_start, both builds write `/data/ampr_emu_status.txt` (version,
 mode, app0 rw/ro, hook rc, index ok/fail/skip, one `missing <symbol>` per
-hook that did not install; `write_status` in `rt/exports.rs`); kraken-mount
+hook that did not install, as `failed`, `alias` or `absent <symbol>`:
+only `failed` loses coverage, `HOOK_NOTE` in `rt/hook.rs`; `write_status` in
+`rt/exports.rs`); kraken-mount
 reads it after each launch. Reads: a single-segment read()/pread() whose
 chunks are all Ready in the decoded cache is copied on the caller's thread
 (`read_cached_inline`, `rt/pack/fd_read.rs`); other reads go through the

@@ -200,8 +200,12 @@ unsafe fn notify_loaded() {
 /// which hooks did not install. Plain text, one `key value` per line:
 /// `ampr-emu-ng <version>`, `mode <plain|lz4|zstd|pkg>`, `app0 <rw|ro>`,
 /// `hooks <rc>` (amprInstallLibkernelHooks), `index <ok|fail|skip>`, then
-/// one `missing <symbol>` per hook that did not install. A failed open or
-/// write is ignored: the game runs the same without it.
+/// one line per hook that did not install: `failed <symbol>` (the detour
+/// failed: coverage lost, the launcher warns), `alias <symbol>` (another
+/// name of a function hooked under its other name: served) or `absent
+/// <symbol>` (not exported by this firmware). Before 0.5.3 all three were
+/// `missing`. A failed open or write is ignored: the game runs the same
+/// without it.
 pub(crate) const STATUS_PATH: &core::ffi::CStr = c"/data/ampr_emu_status.txt";
 
 /// Status text into `out`; its length. Lines past `out` are dropped whole.
@@ -210,7 +214,7 @@ pub(crate) fn status_text(
     writable: bool,
     hooks_rc: c_int,
     index: &[u8],
-    missing: &[&[u8]],
+    missing: &[(&[u8], u8)],
     out: &mut [u8],
 ) -> usize {
     let mut n = 0;
@@ -242,8 +246,13 @@ pub(crate) fn status_text(
     let mut num = [0u8; 12];
     line(&[b"hooks ", decimal(hooks_rc as i64, &mut num)]);
     line(&[b"index ", index]);
-    for m in missing {
-        line(&[b"missing ", m]);
+    for (m, note) in missing {
+        let key: &[u8] = match *note {
+            hook::HOOK_NOTE_ALIAS => b"alias ",
+            hook::HOOK_NOTE_ABSENT => b"absent ",
+            _ => b"failed ",
+        };
+        line(&[key, m]);
     }
     n
 }
@@ -274,12 +283,12 @@ unsafe fn write_status(hooks_rc: c_int, index: &[u8]) {
     const O_CREAT: c_int = 0x200;
     const O_TRUNC: c_int = 0x400;
     const MISSING_MAX: usize = 32;
-    let mut missing: [&[u8]; MISSING_MAX] = [b""; MISSING_MAX];
+    let mut missing: [(&[u8], u8); MISSING_MAX] = [(b"", 0); MISSING_MAX];
     let mut count = 0;
     unsafe {
-        hook::for_each_missing_hook(|sym| {
+        hook::for_each_missing_hook(|sym, note| {
             if count < MISSING_MAX {
-                missing[count] = sym.to_bytes();
+                missing[count] = (sym.to_bytes(), note);
                 count += 1;
             }
         })
@@ -310,11 +319,18 @@ unsafe fn write_status(hooks_rc: c_int, index: &[u8]) {
 #[test]
 fn status_text_lists_mode_hooks_and_missing() {
     let mut out = [0u8; 512];
-    let n = status_text(b"pkg", true, -1, b"ok", &[b"read", b"openat"], &mut out);
+    let n = status_text(
+        b"pkg",
+        true,
+        -1,
+        b"ok",
+        &[(b"read", hook::HOOK_NOTE_FAILED), (b"openat", hook::HOOK_NOTE_ALIAS), (b"x", hook::HOOK_NOTE_ABSENT)],
+        &mut out,
+    );
     let beta = if BETA_REV.is_empty() { String::new() } else { format!("-beta.{BETA_REV}") };
     assert_eq!(
         core::str::from_utf8(&out[..n]).unwrap(),
-        format!("ampr-emu-ng {VERSION}{beta}\nmode pkg\napp0 rw\nhooks -1\nindex ok\nmissing read\nmissing openat\n")
+        format!("ampr-emu-ng {VERSION}{beta}\nmode pkg\napp0 rw\nhooks -1\nindex ok\nfailed read\nalias openat\nabsent x\n")
     );
     let mut small = [0u8; 20];
     let n = status_text(b"plain", false, 0, b"skip", &[], &mut small);
