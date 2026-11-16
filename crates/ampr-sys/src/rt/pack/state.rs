@@ -42,7 +42,10 @@ pub(crate) unsafe fn pack_state_create() -> *mut PackState {
             st.prefetch_head = INVALID_INDEX;
             st.prefetch_tail = INVALID_INDEX;
             st.decoded_cache_target_bytes = super::super::tune::decoded_bytes();
-            st.requested_workers = super::super::tune::workers();
+            // The latency reserve comes on top of the bulk workers.
+            st.requested_workers = (super::super::tune::workers()
+                + AMPR_EMU_PACK_LATENCY_RESERVE_WORKERS)
+                .min(AMPR_EMU_PACK_WORKER_CAPACITY as u32);
             st.latency_reserve_workers = AMPR_EMU_PACK_LATENCY_RESERVE_WORKERS;
             st.pipeline_free_head = INVALID_INDEX;
             st.cache_free_head = INVALID_INDEX;

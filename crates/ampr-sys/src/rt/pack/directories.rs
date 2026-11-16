@@ -479,8 +479,8 @@ pub unsafe fn ampr_pack_is_virtual_directory_fd(fd: c_int) -> bool {
 
 /// Copies the path of an open virtual directory fd into `out` (truncated,
 /// NUL-terminated) and returns its length; None for any other fd. Debug
-/// probes (rt/probe.rs) log it so `/fsfail` dedups by directory.
-#[cfg(feature = "mem_report")]
+/// probes (rt/probe.rs) log it so `/fsfail` dedups by directory; the *at
+/// hooks (rt/index.rs `at_path`) join a relative path to it.
 pub(crate) unsafe fn virtual_directory_fd_path(fd: c_int, out: &mut [u8]) -> Option<usize> {
     if out.is_empty() {
         return None;

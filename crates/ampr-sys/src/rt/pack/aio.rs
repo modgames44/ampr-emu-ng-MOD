@@ -380,7 +380,10 @@ pub unsafe fn sceKernelAioSubmitReadCommandsMultiple(
                 aio.request = req;
                 aio.file_id = fd_slot.file_id;
                 aio.priority = queue_priority(priority);
-                aio.work_class = classify_work(file_flags, &aio.request);
+                // A stream opened by name (readahead.rs `stream_path`) is
+                // classed like a HOT file: reads under 256 KiB go latency.
+                let class_flags = file_flags | if fd_slot.stream { AMPR_PACK_FILE_HOT } else { 0 };
+                aio.work_class = classify_work(class_flags, &aio.request);
                 aio.cancel_requested.store(false, Ordering::Relaxed);
                 let result = aio.request.result;
                 if !result.is_null() {

@@ -462,6 +462,58 @@ static READ_DONE_CVS: [Condvar; READ_DONE_CV_COUNT] = {
 static READ_DONE_NEXT: AtomicU32 = AtomicU32::new(0);
 /// Calls queued for the read threads, oldest first, under READ_M.
 static READ_CALLS: SyncCell<Fifo<*mut ReadCall, READ_QUEUE>> = SyncCell::new(Fifo::new());
+/// Small calls (at most READ_FAST_MAX_BYTES), taken before READ_CALLS: an
+/// audio or video stream's 16-64 KiB read no longer waits behind several
+/// multi-MiB asset reads for one of the READ_THREADS. Under READ_M.
+static READ_FAST_CALLS: SyncCell<Fifo<*mut ReadCall, READ_QUEUE>> = SyncCell::new(Fifo::new());
+/// The small-call bound: the pack's latency class (schedule.rs).
+const READ_FAST_MAX_BYTES: u64 = AMPR_EMU_PACK_LATENCY_READ_MAX_BYTES;
+/// Small calls popped in a row while large ones waited; at READ_FAST_BURST
+/// the oldest large call goes first, so large reads are never starved.
+/// Under READ_M.
+static READ_FAST_STREAK: SyncCell<u32> = SyncCell::new(0);
+const READ_FAST_BURST: u32 = 8;
+
+/// Under READ_M: queues `call` in the FIFO its size picks; false when full.
+unsafe fn read_queue_push(call: *mut ReadCall) -> bool {
+    unsafe {
+        if (*call).length <= READ_FAST_MAX_BYTES {
+            (*READ_FAST_CALLS.get()).push(call)
+        } else {
+            (*READ_CALLS.get()).push(call)
+        }
+    }
+}
+
+/// Under READ_M: the next call, small ones first (see READ_FAST_STREAK).
+unsafe fn read_queue_pop() -> Option<*mut ReadCall> {
+    unsafe {
+        pop_prioritized(
+            &mut *READ_FAST_CALLS.get(),
+            &mut *READ_CALLS.get(),
+            &mut *READ_FAST_STREAK.get(),
+        )
+    }
+}
+
+/// `fast` first, but after READ_FAST_BURST fast pops in a row while `slow`
+/// had items, one from `slow`.
+fn pop_prioritized<T: Copy, const N: usize>(
+    fast: &mut Fifo<T, N>,
+    slow: &mut Fifo<T, N>,
+    streak: &mut u32,
+) -> Option<T> {
+    if *streak < READ_FAST_BURST {
+        if let Some(item) = fast.pop() {
+            if slow.head != slow.tail {
+                *streak += 1;
+            }
+            return Some(item);
+        }
+    }
+    *streak = 0;
+    slow.pop().or_else(|| fast.pop())
+}
 /// Length of READ_CALLS, changed under READ_M; a spinning read thread polls
 /// it without the lock.
 static READ_QUEUED: AtomicU32 = AtomicU32::new(0);
@@ -574,7 +626,7 @@ unsafe extern "C" fn read_thread(arg: *mut c_void) -> *mut c_void {
                     leave();
                     return null_mut();
                 }
-                if let Some(call) = unsafe { (*READ_CALLS.get()).pop() } {
+                if let Some(call) = unsafe { read_queue_pop() } {
                     READ_QUEUED.fetch_sub(1, Ordering::Release);
                     // One slot freed: one caller waiting on a full queue
                     // can push.
@@ -838,7 +890,7 @@ unsafe fn read_on_read_thread(
                 return unsafe { read_inline(fd, vector, offset, length) };
             }
         }
-        if unsafe { (*READ_CALLS.get()).push(p) } {
+        if unsafe { read_queue_push(p) } {
             READ_QUEUED.fetch_add(1, Ordering::Release);
             break;
         }
@@ -930,7 +982,111 @@ unsafe fn read_slot_at(
         Ok(n) => n,
         Err(e) => return e as ssize_t,
     };
+    if let Some(n) = unsafe { read_cached_inline(state, slot.file_id, vector, offset as u64, length) } {
+        return n;
+    }
     unsafe { read_on_read_thread(fd, vector, offset as u64, length) }
+}
+
+/// Most chunks the inline path pins for one read: 8 x 256 KiB chunks, 2 MiB.
+const INLINE_READ_MAX_TASKS: usize = 8;
+
+/// A read whose chunks are all decoded already, copied on the caller's
+/// thread: no read thread handoff, no AIO submit, no worker wake. Only a
+/// single-segment read (read/pread; readv goes the usual way) of at most
+/// INLINE_READ_MAX_TASKS chunks, all Ready in the decoded cache; anything
+/// else returns None and takes the worker path, which loads and decodes.
+/// The frame stays small (the pins below, ~200 B), so a small-stack game
+/// thread can run it, unlike `read_on_workers`. The caller's
+/// PackSubmission keeps the cache alive; the pins keep each entry.
+unsafe fn read_cached_inline(
+    state: *const PackState,
+    file_id: u32,
+    vector: &[SceKernelIovec],
+    offset: u64,
+    length: u64,
+) -> Option<ssize_t> {
+    let [segment] = vector else { return None };
+    if segment.iov_base.is_null() || (segment.iov_len as u64) < length {
+        return None;
+    }
+    let state_mut = state as *mut PackState;
+    if unsafe { (*state).cache_base.is_null() || (*state).cache_page_count == 0 } {
+        return None;
+    }
+    let (file, _size, flags) = unsafe { packed_read_file(state, file_id) }?;
+    // Never admitted (caches.rs), so never a hit.
+    if flags & AMPR_PACK_FILE_STREAMING != 0 {
+        return None;
+    }
+    let count = unsafe { ampr_pack_core_task_count(file.ptr(), offset, length) };
+    if count == 0 || count > INLINE_READ_MAX_TASKS {
+        return None;
+    }
+    let chunk_count = unsafe { pack_chunk_count(state) };
+    let mut tasks = [AmprPackBlockReadTask::default(); INLINE_READ_MAX_TASKS];
+    let mut covered = 0u64;
+    for (i, task) in tasks[..count].iter_mut().enumerate() {
+        if unsafe {
+            ampr_pack_core_make_task(&(*state).core_view, file.ptr(), offset, length, i, task)
+        } != AMPR_PACK_CORE_OK
+            || task.chunk_index as u64 >= chunk_count
+            || task.chunk.flags & AMPR_PACK_CHUNK_STREAMING != 0
+            || task.destination_offset as u64 + task.copy_length as u64 > length
+            || task.source_offset as u64 + task.copy_length as u64 > task.chunk.raw_size as u64
+        {
+            return None;
+        }
+        covered += task.copy_length as u64;
+    }
+    if covered != length {
+        return None;
+    }
+    // Pin every chunk or none: one lock hold, Ready entries only (a Loading
+    // or missing chunk is the workers' job).
+    let mut leases = [CacheLease::EMPTY; INLINE_READ_MAX_TASKS];
+    {
+        let _lock = CACHE_MUTEX.lock();
+        for (task, lease) in tasks[..count].iter().zip(leases.iter_mut()) {
+            let found = unsafe { cache_find_locked(state_mut, &task.chunk, chunk_key_hash(&task.chunk)) };
+            if found == INVALID_INDEX {
+                break;
+            }
+            let entry = unsafe { &mut (*state_mut).cache_entries[found as usize] };
+            if entry.state != CacheEntryState::Ready {
+                break;
+            }
+            entry.pin_count += 1;
+            entry.referenced = true;
+            lease.entry = found;
+            lease.data = unsafe {
+                (*state)
+                    .cache_base
+                    .add(entry.page_start as usize * PACK_CACHE_PAGE_BYTES)
+            };
+        }
+    }
+    let all = leases[..count].iter().all(|l| l.entry != INVALID_INDEX);
+    if all {
+        let out = segment.iov_base as *mut u8;
+        for (task, lease) in tasks[..count].iter().zip(leases.iter()) {
+            let start = stats::now();
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    lease.data.add(task.source_offset as usize),
+                    out.add(task.destination_offset as usize),
+                    task.copy_length as usize,
+                )
+            };
+            stats::add(stats::Stat::CopyNs, stats::since(start));
+            stats::add(stats::Stat::CopyBytes, task.copy_length as u64);
+        }
+        stats::add(stats::Stat::CacheHits, count as u64);
+    }
+    for lease in leases[..count].iter_mut() {
+        unsafe { cache_release(lease) };
+    }
+    all.then_some(length as ssize_t)
 }
 
 /// pread/preadv: the slot cursor is neither read nor moved, so concurrent
@@ -1686,6 +1842,36 @@ mod tests {
         iov_base: core::ptr::null_mut(),
         iov_len: 0,
     };
+
+    #[test]
+    fn small_reads_go_first_without_starving_large_ones() {
+        let (mut fast, mut slow) = (Fifo::<u32, 64>::new(), Fifo::<u32, 64>::new());
+        let mut streak = 0;
+        assert!(slow.push(1000));
+        for i in 0..20 {
+            assert!(fast.push(i));
+        }
+        let order: Vec<u32> =
+            core::iter::from_fn(|| pop_prioritized(&mut fast, &mut slow, &mut streak)).collect();
+        let burst = READ_FAST_BURST as usize;
+        assert_eq!(order[..burst], (0..READ_FAST_BURST).collect::<Vec<_>>()[..]);
+        assert_eq!(order[burst], 1000);
+        assert_eq!(order.len(), 21);
+        // Only small calls queued: no streak builds up.
+        assert!(fast.push(7));
+        assert_eq!(pop_prioritized(&mut fast, &mut slow, &mut streak), Some(7));
+        assert_eq!(streak, 0);
+    }
+
+    #[test]
+    fn read_write_opens_without_create_or_trunc_are_served() {
+        assert!(pack_open_flags_supported(0));
+        assert!(pack_open_flags_supported(O_NONBLOCK));
+        assert!(pack_open_flags_supported(0x2));
+        for bad in [0x1, 0x2 | 0x200, 0x2 | 0x400, 0x2 | 0x8, 0x2 | 0x800, O_DIRECTORY, 0x3] {
+            assert!(!pack_open_flags_supported(bad), "{bad:#x}");
+        }
+    }
 
     #[test]
     fn iov_vectors_are_validated() {

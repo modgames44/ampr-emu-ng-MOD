@@ -84,7 +84,11 @@ real directories.
 A write-open of a packed file gets the upstream answer: the pack does not
 take it, and it goes to the real call on the indexed path
 (`pack_open_flags_supported` in `rt/pack/slots.rs`). Later reads of that
-path still come from the pack.
+path still come from the pack. One exception, on any /app0: `O_RDWR`
+without `O_CREAT`, `O_TRUNC`, `O_APPEND` or `O_EXCL` gets a read-only
+virtual fd. Titles open data files read-write and only read them; the
+physical open failed with ENOENT (a packed file has no copy) and the title
+did not start. A write on that fd fails with EBADF.
 
 ## Access
 
@@ -95,8 +99,9 @@ loose file hit goes to the real `access`, as described above.
 
 Hook coverage is the same as upstream. `open`, `stat`,
 `sceKernelCheckReachability`, `unlink` and `rename` install in every title;
-`access`, `lstat`, `_open`, `_openat`, `sceKernelOpen` and `sceKernelStat`
-install only in a title with packs (`hook_enabled` in `rt/hook.rs`).
+`access`, `lstat`, `_open`, `_openat`, `sceKernelOpen`, `sceKernelStat`
+and the exported `openat`, `fstatat` and `faccessat` install only in a
+title with packs (`hook_enabled` in `rt/hook.rs`).
 Unhooked calls reach the filesystem directly.
 
 ## ShadowMount mounts

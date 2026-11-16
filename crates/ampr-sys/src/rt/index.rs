@@ -2629,6 +2629,10 @@ unsafe fn open_resolved(
                 };
                 if handled {
                     stats::add(stats::Stat::OpenVirtual, 1);
+                    if rc >= 0 {
+                        let name = unsafe { core::ffi::CStr::from_ptr(path) }.to_bytes();
+                        unsafe { super::pack::ampr_pack_mark_stream_fd(rc, name) };
+                    }
                     #[cfg(feature = "mem_report")]
                     if rc < 0 {
                         stats::fs_event(b'Q', b'H', rc as i64, path);
@@ -3152,6 +3156,170 @@ pub unsafe extern "C" fn underscore_openat_emul(
     unsafe { open_with(path, flags, creat_mode(flags, mode), real_openat_cwd, b'A') }
 }
 
+// ---- *at path calls and dup (hook ids 112..=115, titles with packs) --------
+
+/// FreeBSD `AT_EACCESS` and `AT_SYMLINK_NOFOLLOW`.
+const AT_EACCESS: c_int = 0x100;
+const AT_SYMLINK_NOFOLLOW: c_int = 0x200;
+
+/// Whether an *at call's path goes to the index as is: absolute, or
+/// relative to the cwd (`AT_FDCWD`, as `underscore_openat_emul`).
+unsafe fn at_path_direct(dirfd: c_int, path: *const c_char) -> bool {
+    !path.is_null() && (unsafe { *path } == b'/' as c_char || dirfd == AT_FDCWD)
+}
+
+/// `dirfd`'s virtual directory path + "/" + `path` into `buf`, for a
+/// relative path under a virtual directory fd (a packed-only directory has
+/// no real fd to resolve it against). None: a real dirfd, or a joined path
+/// too long; the caller runs the original unchanged. Only the cold
+/// `*_joined` paths below call it, so the common absolute-path call keeps
+/// no path buffer in its frame (hooks run on the game's stacks;
+/// tools/check_stack_frames.py).
+unsafe fn at_join(dirfd: c_int, path: *const c_char, buf: &mut EntryPath) -> Option<*const c_char> {
+    if path.is_null() {
+        return None;
+    }
+    let n = unsafe { super::pack::virtual_directory_fd_path(dirfd, &mut buf[..]) }?;
+    let tail = unsafe { core::ffi::CStr::from_ptr(path) }.to_bytes();
+    if n == 0 || n + 1 + tail.len() + 1 > buf.len() {
+        return None;
+    }
+    let mut at = n;
+    if buf[at - 1] != b'/' {
+        buf[at] = b'/';
+        at += 1;
+    }
+    buf[at..at + tail.len()].copy_from_slice(tail);
+    buf[at + tail.len()] = 0;
+    Some(buf.as_ptr().cast())
+}
+
+type OpenatFn = unsafe extern "C" fn(c_int, *const c_char, c_int, ...) -> c_int;
+type FstatatFn = unsafe extern "C" fn(c_int, *const c_char, *mut c_void, c_int) -> c_int;
+type FaccessatFn = unsafe extern "C" fn(c_int, *const c_char, c_int, c_int) -> c_int;
+
+unsafe fn orig_openat(dirfd: c_int, path: *const c_char, flags: c_int, mode: c_int) -> c_int {
+    match unsafe { kernel_slot::<OpenatFn>(hook::openat) } {
+        Some(f) => unsafe { f(dirfd, path, flags, mode) },
+        None => eio(),
+    }
+}
+
+unsafe fn orig_fstatat(dirfd: c_int, path: *const c_char, sb: *mut c_void, flag: c_int) -> c_int {
+    match unsafe { kernel_slot::<FstatatFn>(hook::fstatat) } {
+        Some(f) => unsafe { f(dirfd, path, sb, flag) },
+        None => eio(),
+    }
+}
+
+unsafe fn orig_faccessat(dirfd: c_int, path: *const c_char, mode: c_int, flag: c_int) -> c_int {
+    match unsafe { kernel_slot::<FaccessatFn>(hook::faccessat) } {
+        Some(f) => unsafe { f(dirfd, path, mode, flag) },
+        None => eio(),
+    }
+}
+
+/// `openat` of an absolute path (the joined one included), as `RealOpen`.
+unsafe fn real_exported_openat_cwd(path: *const c_char, flags: c_int, mode: SceKernelMode) -> c_int {
+    unsafe { orig_openat(AT_FDCWD, path, flags, mode as c_int) }
+}
+
+unsafe fn real_fstatat_follow(path: *const c_char, sb: *mut c_void) -> c_int {
+    unsafe { orig_fstatat(AT_FDCWD, path, sb, 0) }
+}
+
+unsafe fn real_fstatat_nofollow(path: *const c_char, sb: *mut c_void) -> c_int {
+    unsafe { orig_fstatat(AT_FDCWD, path, sb, AT_SYMLINK_NOFOLLOW) }
+}
+
+/// The exported `openat`: routed like `_openat` (`open_with`), so a packed
+/// file gets its virtual fd; a relative path under a virtual directory fd
+/// is joined first. Variadic mode in the fourth register, as `_openat`.
+pub unsafe extern "C" fn openat_emul(dirfd: c_int, path: *const c_char, flags: c_int, mode: c_int) -> c_int {
+    if unsafe { at_path_direct(dirfd, path) } {
+        return unsafe { open_with(path, flags, creat_mode(flags, mode), real_exported_openat_cwd, b'T') };
+    }
+    unsafe { openat_joined(dirfd, path, flags, mode) }
+}
+
+#[inline(never)]
+#[cold]
+unsafe fn openat_joined(dirfd: c_int, path: *const c_char, flags: c_int, mode: c_int) -> c_int {
+    let mut buf: EntryPath = [0; PATH_BUF];
+    match unsafe { at_join(dirfd, path, &mut buf) } {
+        Some(p) => unsafe { open_with(p, flags, creat_mode(flags, mode), real_exported_openat_cwd, b'T') },
+        None => unsafe { orig_openat(dirfd, path, flags, mode) },
+    }
+}
+
+/// The exported `fstatat`: `stat`/`lstat` routing (AT_SYMLINK_NOFOLLOW),
+/// so a packed file or packed-only directory exists. Other flags go to the
+/// original.
+pub unsafe extern "C" fn fstatat_emul(dirfd: c_int, path: *const c_char, sb: *mut c_void, flag: c_int) -> c_int {
+    if flag & !AT_SYMLINK_NOFOLLOW != 0 || sb.is_null() || path.is_null() {
+        return unsafe { orig_fstatat(dirfd, path, sb, flag) };
+    }
+    let real: RealStat = if flag & AT_SYMLINK_NOFOLLOW != 0 {
+        real_fstatat_nofollow
+    } else {
+        real_fstatat_follow
+    };
+    if unsafe { at_path_direct(dirfd, path) } {
+        return unsafe { stat_with(path, sb.cast(), real, b'F') };
+    }
+    unsafe { fstatat_joined(dirfd, path, sb, flag, real) }
+}
+
+#[inline(never)]
+#[cold]
+unsafe fn fstatat_joined(dirfd: c_int, path: *const c_char, sb: *mut c_void, flag: c_int, real: RealStat) -> c_int {
+    let mut buf: EntryPath = [0; PATH_BUF];
+    match unsafe { at_join(dirfd, path, &mut buf) } {
+        Some(p) => unsafe { stat_with(p, sb.cast(), real, b'F') },
+        None => unsafe { orig_fstatat(dirfd, path, sb, flag) },
+    }
+}
+
+/// The exported `faccessat`: `access` routing (AT_EACCESS changes nothing
+/// for an indexed file: there are no set-id bits). Other flags go to the
+/// original.
+pub unsafe extern "C" fn faccessat_emul(dirfd: c_int, path: *const c_char, mode: c_int, flag: c_int) -> c_int {
+    if flag & !AT_EACCESS != 0 || path.is_null() {
+        return unsafe { orig_faccessat(dirfd, path, mode, flag) };
+    }
+    // The physical fallback keeps the caller's flag.
+    let real = |q: *const c_char, m: c_int| unsafe { orig_faccessat(AT_FDCWD, q, m, flag) };
+    if unsafe { at_path_direct(dirfd, path) } {
+        return unsafe { access_with(path, mode, &real, b'C') };
+    }
+    unsafe { faccessat_joined(dirfd, path, mode, flag) }
+}
+
+#[inline(never)]
+#[cold]
+unsafe fn faccessat_joined(dirfd: c_int, path: *const c_char, mode: c_int, flag: c_int) -> c_int {
+    let mut buf: EntryPath = [0; PATH_BUF];
+    let real = |q: *const c_char, m: c_int| unsafe { orig_faccessat(AT_FDCWD, q, m, flag) };
+    match unsafe { at_join(dirfd, path, &mut buf) } {
+        Some(p) => unsafe { access_with(p, mode, &real, b'C') },
+        None => unsafe { orig_faccessat(dirfd, path, mode, flag) },
+    }
+}
+
+/// `dup` of a virtual pack fd: a new virtual fd on the same file, its
+/// cursor copied (later moves are not shared, unlike a kernel dup). Any
+/// other fd: the original.
+pub unsafe extern "C" fn dup_emul(fd: c_int) -> c_int {
+    if let Some(rc) = unsafe { super::pack::ampr_pack_try_dup_fd(fd) } {
+        return posix_return_from_sce(rc);
+    }
+    type DupFn = unsafe extern "C" fn(c_int) -> c_int;
+    match unsafe { kernel_slot::<DupFn>(hook::dup) } {
+        Some(f) => unsafe { f(fd) },
+        None => eio(),
+    }
+}
+
 pub unsafe extern "C" fn posix_lstat_emul(path: *const c_char, sb: *mut Stat) -> c_int {
     if super::hook::observed_only(hook::lstat) {
         let rc = unsafe { real_lstat(path, sb.cast()) };
@@ -3174,10 +3342,22 @@ pub unsafe extern "C" fn posix_access_emul(path: *const c_char, mode: c_int) -> 
         unsafe { observe_note(path, b'a', rc) };
         return rc;
     }
+    let real = |p: *const c_char, m: c_int| unsafe { real_access(p, m) };
+    unsafe { access_with(path, mode, &real, b'a') }
+}
+
+/// `posix_access_emul` with `real` as the original (`faccessat_emul`
+/// passes its own) and `op` as the debug trace letter.
+unsafe fn access_with(
+    path: *const c_char,
+    mode: c_int,
+    real: &dyn Fn(*const c_char, c_int) -> c_int,
+    op: u8,
+) -> c_int {
     let mut pbuf: EntryPath = [0; PATH_BUF];
     let mut l = unsafe { lookup_resident(path, &mut pbuf, true) };
-    let rc = unsafe { access_resolved(&mut l, &mut pbuf, path, mode) };
-    stats::fs_event(b'a', how(&l), rc as i64, path);
+    let rc = unsafe { access_resolved(&mut l, &mut pbuf, path, mode, real) };
+    stats::fs_event(op, how(&l), rc as i64, path);
     rc
 }
 
@@ -3187,12 +3367,13 @@ unsafe fn access_resolved(
     pbuf: &mut EntryPath,
     path: *const c_char,
     mode: c_int,
+    real: &dyn Fn(*const c_char, c_int) -> c_int,
 ) -> c_int {
     match l.state {
         Resident::Hit if unsafe { live_loose_hit(l) } => {
-            match unsafe { hit_call(l, pbuf, path, true, |p| real_access(p, mode)) } {
+            match unsafe { hit_call(l, pbuf, path, true, |p| real(p, mode)) } {
                 Loose::Done(rc) => rc,
-                Loose::Miss => unsafe { access_resolved(l, pbuf, path, mode) },
+                Loose::Miss => unsafe { access_resolved(l, pbuf, path, mode, real) },
                 Loose::Io => {
                     set_errno(EIO);
                     -1
@@ -3223,7 +3404,7 @@ unsafe fn access_resolved(
                 posix_return_from_sce(rc)
             } else {
                 let pack_io = rc == SCE_KERNEL_ERROR_EIO;
-                let rc = unsafe { with_miss_path(path, |p| real_access(p, mode)) };
+                let rc = unsafe { with_miss_path(path, |p| real(p, mode)) };
                 unsafe { io_miss_if(l.io || pack_io, rc) }
             }
         }
@@ -3231,7 +3412,7 @@ unsafe fn access_resolved(
             let mut st = core::mem::MaybeUninit::<Stat>::uninit();
             unsafe { stat_resolved(l, pbuf, path, st.as_mut_ptr(), real_lstat) }
         }
-        _ => unsafe { real_access(path, mode) },
+        _ => real(path, mode),
     }
 }
 

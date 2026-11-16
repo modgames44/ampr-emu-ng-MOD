@@ -91,16 +91,25 @@ pub(crate) unsafe fn cache_take_failed_locked(
     0
 }
 
+/// `partial`: the read copies only part of the chunk. A partial read is
+/// admitted on its first touch: the rest of the chunk is usually read next
+/// (a stream reading 16-64 KiB of a 256 KiB chunk), and without admission
+/// every such read decoded the whole chunk again (pkg: the full Kraken
+/// block, read and decoded twice before the second-touch rule kept it).
 pub(crate) unsafe fn cache_should_admit_locked(
     state: *mut PackState,
     chunk: &AmprPackChunkView,
     file_flags: u32,
     key_hash: u64,
+    partial: bool,
 ) -> bool {
     if file_flags & AMPR_PACK_FILE_STREAMING != 0 || chunk.flags & AMPR_PACK_CHUNK_STREAMING != 0 {
         return false;
     }
-    if file_flags & AMPR_PACK_FILE_HOT != 0 || chunk.flags & AMPR_PACK_CHUNK_SHARED != 0 {
+    if partial
+        || file_flags & AMPR_PACK_FILE_HOT != 0
+        || chunk.flags & AMPR_PACK_CHUNK_SHARED != 0
+    {
         return true;
     }
     let touch = &mut (*state).touches
@@ -121,13 +130,14 @@ pub(crate) unsafe fn cache_should_admit_locked(
 /// the admission policy, so a missing chunk always gets a Load lease if room.
 /// `waiter`: the caller got Pending for this chunk last time and was woken by
 /// a publication, so a Failed entry is its loader's answer (see
-/// cache_take_failed_locked).
+/// cache_take_failed_locked). `partial`: see cache_should_admit_locked.
 pub(crate) unsafe fn cache_acquire(
     chunk: &AmprPackChunkView,
     file_flags: u32,
     wait_for_loader: bool,
     force_admit: bool,
     mut waiter: bool,
+    partial: bool,
 ) -> CacheAcquireResult {
     let state = unsafe { pack_state() };
     let mut result = CacheAcquireResult::EMPTY;
@@ -176,7 +186,7 @@ pub(crate) unsafe fn cache_acquire(
             }
         }
 
-        if !force_admit && !cache_should_admit_locked(state, chunk, file_flags, key_hash) {
+        if !force_admit && !cache_should_admit_locked(state, chunk, file_flags, key_hash, partial) {
             return result;
         }
         let page_count =

@@ -80,7 +80,16 @@ AMPR_DEBUG_POOL_SIZE ?= $(if $(filter 1,$(AMPR_ZSTD_MMAP)),0xaee8000,0xae78000)
 # while jobs queue and retires by load, so the game gets thread slots back.
 # 4: decode takes 14-29 us per chunk and ~0.21 cores on a zstd title, and
 # 4 vs 8 gave 312 vs 315 us game wait per read (debug /metrics).
+# The Buffer ledger is sized for these workers. AMPR_PACK_LATENCY_RESERVE
+# (default 1) starts that many more at run time, kept for reads of at most
+# 64 KiB (schedule.rs latency class), so an audio or video stream never
+# waits for a worker busy with level data: the setting of the pkg runtime
+# profile kraken-mount writes, which fixed audio drift in pkg titles, now
+# the default for zstd and LZ4 too. 4 + 1 fit the same ledger with 11
+# pipelines instead of 12 (worker.rs `buffer_split`); no memory added. An
+# LZ4 or pkg runtime profile still overrides both.
 AMPR_PACK_WORKERS ?= 4
+AMPR_PACK_LATENCY_RESERVE ?= 1
 # Pack read pipelines (1..32), read by rt/pack/mod.rs and rt/tune.rs: the
 # slot count and the default pipeline count, debug build too, so the debug
 # `pipelines` knob and profiles stop at it (build with 32 to tune above 12).
@@ -140,7 +149,15 @@ AMPR_ZSTD_MMAP ?= 2
 # second, lighter game it doubled disk bytes (1.69 vs 0.78 per game byte) and
 # the worst read (13.4 vs 5.6 ms). Prefetched chunks land in the decoded
 # cache (64 MiB, rt/pack/readahead.rs); read-ahead was not re-measured with it.
-AMPR_PACK_READAHEAD_CHUNKS ?= 0
+# 4 with AMPR_PACK_READAHEAD_HOT_ONLY=1 (default): read-ahead runs only for
+# streams: files the manifest marks HOT (kraken-mount marks audio and video
+# in pkg manifests) and, in every format, files opened by an audio/video
+# name (.bk2, .usm, .mp4, .wem, .bnk, ...), 4 chunks (1 MiB of 256 KiB blocks)
+# ahead of a sequential stream, so a cutscene's next block is decoded before
+# the player asks for it. Other files keep the measurement above (off).
+# Setting the HOT_ONLY knob to 0 applies the window to every packed file.
+AMPR_PACK_READAHEAD_CHUNKS ?= 4
+AMPR_PACK_READAHEAD_HOT_ONLY ?= 1
 AMPR_PACK_READAHEAD_MAX_DISK_INFLIGHT ?= 2
 # Git revision in the debug build's /metrics (rt/exports.rs BUILD_REV):
 # short hash, "-dirty" with uncommitted tracked changes. ps5/build-docker.sh
@@ -156,9 +173,9 @@ AMPR_BETA ?= 0
 # cargo, so a dist run with the pool knobs in one argument built a debug
 # PRX identical to the default one (out/*/obj/build-config.txt).
 BUILD_KNOBS := AMPR_MEM_REPORT AMPR_INTERNAL_POOL_SIZE AMPR_DEBUG_POOL_SIZE \
-  AMPR_PACK_WORKERS AMPR_PACK_PIPELINES AMPR_ZSTD_LIBC_HOOKS AMPR_ZSTD_MMAP \
+  AMPR_PACK_WORKERS AMPR_PACK_LATENCY_RESERVE AMPR_PACK_PIPELINES AMPR_ZSTD_LIBC_HOOKS AMPR_ZSTD_MMAP \
   AMPR_PACK_READAHEAD_CHUNKS AMPR_PACK_READAHEAD_MAX_DISK_INFLIGHT \
-  AMPR_GIT_REV AMPR_BETA
+  AMPR_PACK_READAHEAD_HOT_ONLY AMPR_GIT_REV AMPR_BETA
 $(foreach k,$(BUILD_KNOBS),$(if $(filter 1,$(words $($(k)))),,\
   $(error $(k) must be one word, got '$($(k))'; pass each knob as its own argument)))
 
@@ -220,11 +237,13 @@ $(BUILD_CONFIG): FORCE
 	  printf '%s\n' 'AMPR_MEM_REPORT=$(AMPR_MEM_REPORT)'; \
 	  printf '%s\n' 'AMPR_INTERNAL_POOL_SIZE=$(AMPR_INTERNAL_POOL_SIZE)'; \
 	  printf '%s\n' 'AMPR_PACK_WORKERS=$(AMPR_PACK_WORKERS)'; \
+	  printf '%s\n' 'AMPR_PACK_LATENCY_RESERVE=$(AMPR_PACK_LATENCY_RESERVE)'; \
 	  printf '%s\n' 'AMPR_PACK_PIPELINES=$(AMPR_PACK_PIPELINES)'; \
 	  printf '%s\n' 'AMPR_ZSTD_LIBC_HOOKS=$(AMPR_ZSTD_LIBC_HOOKS)'; \
 	  printf '%s\n' 'AMPR_ZSTD_MMAP=$(AMPR_ZSTD_MMAP)'; \
 	  printf '%s\n' 'AMPR_PACK_READAHEAD_CHUNKS=$(AMPR_PACK_READAHEAD_CHUNKS)'; \
 	  printf '%s\n' 'AMPR_PACK_READAHEAD_MAX_DISK_INFLIGHT=$(AMPR_PACK_READAHEAD_MAX_DISK_INFLIGHT)'; \
+	  printf '%s\n' 'AMPR_PACK_READAHEAD_HOT_ONLY=$(AMPR_PACK_READAHEAD_HOT_ONLY)'; \
 	  printf '%s\n' 'AMPR_GIT_REV=$(AMPR_GIT_REV)'; \
 	  printf '%s\n' 'AMPR_BETA=$(AMPR_BETA)'; \
 	  printf '%s\n' 'PRX_LDFLAGS=$(PRX_LDFLAGS)'; \
@@ -242,7 +261,7 @@ RUST_SOURCES := $(wildcard crates/*/src/*.rs crates/*/src/*/*.rs crates/*/src/*/
 
 $(RUST_STATICLIB): Cargo.toml Cargo.lock $(RUST_SOURCES) $(RUST_TARGET) $(BUILD_MAKEFILE) $(BUILD_CONFIG)
 	CC_x86_64_ps5_freebsd=$(PS5_PAYLOAD_SDK)/bin/prospero-clang AR_x86_64_ps5_freebsd=$(PS5_PAYLOAD_SDK)/bin/prospero-ar CRATE_CC_NO_DEFAULTS=1 CFLAGS_x86_64_ps5_freebsd="$(ZSTD_CFLAGS)" \
-	RUSTC_BOOTSTRAP=1 AMPR_INTERNAL_POOL_SIZE=$(AMPR_INTERNAL_POOL_SIZE) AMPR_PACK_WORKERS=$(AMPR_PACK_WORKERS) AMPR_PACK_PIPELINES=$(AMPR_PACK_PIPELINES) AMPR_ZSTD_LIBC_HOOKS=$(AMPR_ZSTD_LIBC_HOOKS) AMPR_ZSTD_MMAP=$(AMPR_ZSTD_MMAP) AMPR_PACK_READAHEAD_CHUNKS=$(AMPR_PACK_READAHEAD_CHUNKS) AMPR_PACK_READAHEAD_MAX_DISK_INFLIGHT=$(AMPR_PACK_READAHEAD_MAX_DISK_INFLIGHT) AMPR_GIT_REV=$(AMPR_GIT_REV) AMPR_BETA=$(AMPR_BETA) CARGO_TARGET_DIR=$(abspath $(OUT)/cargo) \
+	RUSTC_BOOTSTRAP=1 AMPR_INTERNAL_POOL_SIZE=$(AMPR_INTERNAL_POOL_SIZE) AMPR_PACK_WORKERS=$(AMPR_PACK_WORKERS) AMPR_PACK_LATENCY_RESERVE=$(AMPR_PACK_LATENCY_RESERVE) AMPR_PACK_PIPELINES=$(AMPR_PACK_PIPELINES) AMPR_ZSTD_LIBC_HOOKS=$(AMPR_ZSTD_LIBC_HOOKS) AMPR_ZSTD_MMAP=$(AMPR_ZSTD_MMAP) AMPR_PACK_READAHEAD_CHUNKS=$(AMPR_PACK_READAHEAD_CHUNKS) AMPR_PACK_READAHEAD_MAX_DISK_INFLIGHT=$(AMPR_PACK_READAHEAD_MAX_DISK_INFLIGHT) AMPR_PACK_READAHEAD_HOT_ONLY=$(AMPR_PACK_READAHEAD_HOT_ONLY) AMPR_GIT_REV=$(AMPR_GIT_REV) AMPR_BETA=$(AMPR_BETA) CARGO_TARGET_DIR=$(abspath $(OUT)/cargo) \
 	  $(RUST_CARGO) build -Z build-std=core,alloc -Z json-target-spec \
 	    --release --target $(RUST_TARGET) -p ampr-sys $(if $(filter 1,$(AMPR_MEM_REPORT)),--features mem_report)
 

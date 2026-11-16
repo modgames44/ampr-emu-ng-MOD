@@ -192,6 +192,138 @@ unsafe fn notify_loaded() {
     unsafe { notify(&text[..n]) };
 }
 
+// ---- status file -----------------------------------------------------------
+
+/// `/data/ampr_emu_status.txt`, rewritten at every module_start, both
+/// builds: what the launcher (kraken-mount `launch.rs`) checks after a
+/// launch to tell "ng loaded" from "the system libSceAmpr ran" and to show
+/// which hooks did not install. Plain text, one `key value` per line:
+/// `ampr-emu-ng <version>`, `mode <plain|lz4|zstd|pkg>`, `app0 <rw|ro>`,
+/// `hooks <rc>` (amprInstallLibkernelHooks), `index <ok|fail|skip>`, then
+/// one `missing <symbol>` per hook that did not install. A failed open or
+/// write is ignored: the game runs the same without it.
+pub(crate) const STATUS_PATH: &core::ffi::CStr = c"/data/ampr_emu_status.txt";
+
+/// Status text into `out`; its length. Lines past `out` are dropped whole.
+pub(crate) fn status_text(
+    mode: &[u8],
+    writable: bool,
+    hooks_rc: c_int,
+    index: &[u8],
+    missing: &[&[u8]],
+    out: &mut [u8],
+) -> usize {
+    let mut n = 0;
+    let mut line = |parts: &[&[u8]]| {
+        let len: usize = parts.iter().map(|p| p.len()).sum::<usize>() + 1;
+        if n + len > out.len() {
+            return;
+        }
+        for p in parts {
+            out[n..n + p.len()].copy_from_slice(p);
+            n += p.len();
+        }
+        out[n] = b'\n';
+        n += 1;
+    };
+    let mut ver = [0u8; 40];
+    let mut v = 0;
+    for part in [
+        VERSION.as_bytes(),
+        if BETA_REV.is_empty() { b"" as &[u8] } else { b"-beta." },
+        BETA_REV.as_bytes(),
+    ] {
+        ver[v..v + part.len()].copy_from_slice(part);
+        v += part.len();
+    }
+    line(&[b"ampr-emu-ng ", &ver[..v]]);
+    line(&[b"mode ", mode]);
+    line(&[b"app0 ", if writable { b"rw" } else { b"ro" }]);
+    let mut num = [0u8; 12];
+    line(&[b"hooks ", decimal(hooks_rc as i64, &mut num)]);
+    line(&[b"index ", index]);
+    for m in missing {
+        line(&[b"missing ", m]);
+    }
+    n
+}
+
+/// `v` in decimal, into `buf` (12 bytes hold any i32).
+fn decimal(v: i64, buf: &mut [u8; 12]) -> &[u8] {
+    let neg = v < 0;
+    let mut u = v.unsigned_abs();
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (u % 10) as u8;
+        u /= 10;
+        if u == 0 || i == 1 {
+            break;
+        }
+    }
+    if neg {
+        i -= 1;
+        buf[i] = b'-';
+    }
+    &buf[i..]
+}
+
+/// Writes the status file (see STATUS_PATH).
+unsafe fn write_status(hooks_rc: c_int, index: &[u8]) {
+    const O_WRONLY: c_int = 0x1;
+    const O_CREAT: c_int = 0x200;
+    const O_TRUNC: c_int = 0x400;
+    const MISSING_MAX: usize = 32;
+    let mut missing: [&[u8]; MISSING_MAX] = [b""; MISSING_MAX];
+    let mut count = 0;
+    unsafe {
+        hook::for_each_missing_hook(|sym| {
+            if count < MISSING_MAX {
+                missing[count] = sym.to_bytes();
+                count += 1;
+            }
+        })
+    };
+    let mut text = [0u8; 2048];
+    let n = status_text(
+        super::pack::pack_format().label(),
+        super::rw::app0_writable(),
+        hooks_rc,
+        index,
+        &missing[..count],
+        &mut text,
+    );
+    let Some(open) = (unsafe { super::pack::real_open() }) else {
+        return;
+    };
+    let fd = unsafe { open(STATUS_PATH.as_ptr(), O_WRONLY | O_CREAT | O_TRUNC, 0o666 as c_int) };
+    if fd < 0 {
+        return;
+    }
+    let _ = unsafe { super::index::write_all(fd, &text[..n]) };
+    if let Some(close) = unsafe { super::pack::real_close() } {
+        let _ = unsafe { close(fd) };
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn status_text_lists_mode_hooks_and_missing() {
+    let mut out = [0u8; 512];
+    let n = status_text(b"pkg", true, -1, b"ok", &[b"read", b"openat"], &mut out);
+    let beta = if BETA_REV.is_empty() { String::new() } else { format!("-beta.{BETA_REV}") };
+    assert_eq!(
+        core::str::from_utf8(&out[..n]).unwrap(),
+        format!("ampr-emu-ng {VERSION}{beta}\nmode pkg\napp0 rw\nhooks -1\nindex ok\nmissing read\nmissing openat\n")
+    );
+    let mut small = [0u8; 20];
+    let n = status_text(b"plain", false, 0, b"skip", &[], &mut small);
+    assert!(n <= 20 && small[..n].ends_with(b"\n"));
+    let mut b = [0u8; 12];
+    assert_eq!(decimal(-2147483648, &mut b), b"-2147483648");
+    assert_eq!(decimal(0, &mut b), b"0");
+}
+
 // ---- /bench query parsing and region planning ---------------------------
 
 /// Pure parts of the debug build's `GET /bench?path=/app0/...`, kept apart
@@ -1518,9 +1650,16 @@ pub unsafe extern "C" fn module_start(_args: usize, _argp: *const c_void) -> c_i
     // shipped index this fails at once: ensure_ready(false) never builds one.
     // A title with no packs skips it and loads its index on the first AMPR
     // call.
-    if super::pack::packs_present() && rc == 0 && unsafe { super::index::ensure_ready(false) } {
-        unsafe { super::pack::ampr_pack_ensure_manifest_ready_safe() };
-    }
+    let index: &[u8] = if !super::pack::packs_present() || rc != 0 {
+        b"skip"
+    } else if unsafe { super::index::ensure_ready(false) }
+        && unsafe { super::pack::ampr_pack_ensure_manifest_ready_safe() }
+    {
+        b"ok"
+    } else {
+        b"fail"
+    };
+    unsafe { write_status(rc, index) };
     // Only after hooks install: a failed module_start may be unloaded.
     #[cfg(feature = "mem_report")]
     if rc == 0 {

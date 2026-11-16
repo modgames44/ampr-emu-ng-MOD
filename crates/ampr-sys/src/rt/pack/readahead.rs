@@ -1,5 +1,11 @@
 //! Sequential read-ahead.
 //!
+//! By default only streams get a window (AMPR_EMU_PACK_READAHEAD_HOT_ONLY):
+//! files with AMPR_PACK_FILE_HOT (kraken-mount marks audio and video in pkg
+//! manifests) and fds opened on a stream file name (`stream_path`, for zstd
+//! and dump-forge LZ4 packs, whose indexes have no such flag). Both formats:
+//! the file view is `packed_read_file`, so zstd reads ahead too.
+//!
 //! A virtual read of a packed file that ends in local chunk `b` queues
 //! decoded-cache loads of local chunks `b+1 ..= b+K` (K =
 //! AMPR_EMU_PACK_READAHEAD_CHUNKS, clipped to the file) that are not already
@@ -69,6 +75,41 @@ fn disk_saturated() -> bool {
     PACK_DISK_INFLIGHT.load(Ordering::Acquire) >= super::super::tune::ra_gate()
 }
 
+/// Audio and video stream file names (lower-case extension): what the
+/// zstd and dump-forge LZ4 indexes do not mark, recognised at open
+/// (slots.rs) so their sequential reads get read-ahead. Same list as
+/// kraken-mount's `ampr_index::stream_file`.
+const STREAM_EXTS: &[&[u8]] = &[
+    b"bk2", b"bik", b"usm", b"mp4", b"m4v", b"mov", b"webm", b"avi", b"wmv", b"mkv", b"wem",
+    b"bnk", b"pck", b"fsb", b"bank", b"awb", b"acb", b"at9", b"ogg", b"opus", b"wav", b"xma",
+    b"mp3",
+];
+
+/// Whether `path` (bytes, no NUL) names an audio or video stream.
+pub(crate) fn stream_path(path: &[u8]) -> bool {
+    let name = path.rsplit(|&b| b == b'/').next().unwrap_or(path);
+    let Some(dot) = name.iter().rposition(|&b| b == b'.') else {
+        return false;
+    };
+    let ext = &name[dot + 1..];
+    STREAM_EXTS.iter().any(|e| e.eq_ignore_ascii_case(ext))
+}
+
+/// The read-ahead view of packed file `file_id`, both formats: its task
+/// file, logical size, chunk shift, chunk count and flags (zstd: none).
+unsafe fn readahead_file(
+    state: *const PackState,
+    file_id: u32,
+) -> Option<(TaskFile, u64, u32, u64, u32)> {
+    let (file, size, flags) = unsafe { packed_read_file(state, file_id) }?;
+    let shift = unsafe { ampr_pack_core_chunk_shift(file.ptr()) }?;
+    if shift >= 64 {
+        return None;
+    }
+    let chunks = size.div_ceil(1u64 << shift);
+    Some((file, size, shift, chunks, flags))
+}
+
 /// Last local chunk `request` reads in packed file `file_id`, or None when it
 /// reads no chunk. PACK_M held; the caller validated the file id.
 pub(crate) unsafe fn readahead_last_chunk(
@@ -79,12 +120,9 @@ pub(crate) unsafe fn readahead_last_chunk(
     if k() == 0 || request.offset < 0 || request.nbyte == 0 {
         return None;
     }
-    let file = unsafe { lz4_file(state, file_id.checked_sub(1)?) }?;
-    let (flags, logical_size, shift) =
-        ({ file.flags }, { file.logical_size }, { file.block_shift }
-            as u32);
+    let (_, logical_size, shift, _, _) = unsafe { readahead_file(state, file_id) }?;
     let offset = request.offset as u64;
-    if flags & AMPR_PACK_FILE_PACKED == 0 || offset >= logical_size || shift >= 64 {
+    if offset >= logical_size {
         return None;
     }
     Some(((offset + (request.nbyte as u64).min(logical_size - offset) - 1) >> shift) as u32)
@@ -100,19 +138,20 @@ pub(crate) unsafe fn readahead_window_locked(
     last: u32,
 ) -> (u32, u32) {
     let file_id = (*state).virtual_fds[fd_index as usize].file_id;
-    let Some(file) = file_id
-        .checked_sub(1)
-        .and_then(|i| unsafe { lz4_file(state, i) })
-    else {
+    let Some((_, _, _, chunk_count, flags)) = (unsafe { readahead_file(state, file_id) }) else {
         return (0, 0);
     };
     let slot = &mut (*state).virtual_fds[fd_index as usize];
-    let flags = { file.flags };
     let last = last as u64;
     let k = k() as u64;
-    let end = (last + 1 + k).min({ file.chunk_count } as u64);
+    let end = (last + 1 + k).min(chunk_count);
     if flags & AMPR_PACK_FILE_RANDOM_ACCESS != 0 {
         stats::add(stats::Stat::PrefetchSkipped, end.saturating_sub(last + 1));
+        return (0, 0);
+    }
+    // Only marked streams (audio, video) by default: other files keep the
+    // measured "off" (Makefile AMPR_PACK_READAHEAD_HOT_ONLY).
+    if AMPR_EMU_PACK_READAHEAD_HOT_ONLY && flags & AMPR_PACK_FILE_HOT == 0 && !slot.stream {
         return (0, 0);
     }
     let next = slot.readahead_next as u64;
@@ -141,17 +180,16 @@ pub(crate) unsafe fn queue_readahead(file_id: u32, start: u32, end: u32) -> bool
         return false;
     }
     let state = unsafe { pack_state() };
-    let Some(file) = file_id
-        .checked_sub(1)
-        .and_then(|i| unsafe { lz4_file(state, i) })
-    else {
+    let Some((file, logical_size, shift, _, _)) = (unsafe { readahead_file(state, file_id) }) else {
         return false;
     };
-    let (logical_size, shift) = ({ file.logical_size }, { file.block_shift } as u32);
     let count = end - start;
     let offset = (start as u64) << shift;
+    if offset >= logical_size {
+        return false;
+    }
     let length = ((end as u64) << shift).min(logical_size) - offset;
-    let file_ptr = &file as *const AmprPackFileRecord as *const u8;
+    let file_ptr = file.ptr();
 
     let mut chunks = [AmprPackChunkView::default(); K_CAP];
     let mut planned = 0;
@@ -339,4 +377,20 @@ pub(crate) unsafe fn bench_volume_path(out: &mut [u8; 1024]) -> Option<(usize, u
         unsafe { lz4_pack(state, 0) }?.file_size
     };
     Some((length, file_size))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stream_path;
+
+    #[test]
+    fn stream_names_by_extension() {
+        assert!(stream_path(b"/app0/Movies/Intro.BK2"));
+        assert!(stream_path(b"/app0/audio/PS5/Init.bnk"));
+        assert!(stream_path(b"x.wem"));
+        assert!(!stream_path(b"/app0/data/level1.pak"));
+        assert!(!stream_path(b"/app0/bk2"));
+        assert!(!stream_path(b"/app0/dir.mp4/file"));
+        assert!(!stream_path(b"/app0/a."));
+    }
 }

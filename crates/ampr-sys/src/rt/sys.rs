@@ -463,28 +463,29 @@ pub mod hook {
     // (rt/thread_hooks.rs).
     pub const scePthreadCreate: usize = 110;
     pub const pthread_create: usize = 111;
-    // 112..=119: debug-only pass-through probes of fully packed games, both
+    // 112..=115: both builds, titles with packs: the *at path calls and
+    // dup, routed through the index and the virtual fds (rt/index.rs
+    // `openat_emul` .. `dup_emul`). The exported `openat`/`fstatat`/
+    // `faccessat` do not go through `_openat`/`stat`/`access`, so a packed
+    // file opened or probed with them was missing.
+    pub const openat: usize = 112;
+    pub const fstatat: usize = 113;
+    pub const faccessat: usize = 114;
+    pub const dup: usize = 115;
+    // 116..=119: debug-only pass-through probes of fully packed games, both
     // formats (rt/probe.rs); release builds have no such slots.
     #[cfg(feature = "mem_report")]
-    pub const dup: usize = 112;
+    pub const dup2: usize = 116;
     #[cfg(feature = "mem_report")]
-    pub const dup2: usize = 113;
+    pub const poll: usize = 117;
     #[cfg(feature = "mem_report")]
-    pub const poll: usize = 114;
-    #[cfg(feature = "mem_report")]
-    pub const select: usize = 115;
-    #[cfg(feature = "mem_report")]
-    pub const openat: usize = 116;
-    #[cfg(feature = "mem_report")]
-    pub const fstatat: usize = 117;
-    #[cfg(feature = "mem_report")]
-    pub const faccessat: usize = 118;
+    pub const select: usize = 118;
     #[cfg(feature = "mem_report")]
     pub const readlink: usize = 119;
     #[cfg(feature = "mem_report")]
     pub const COUNT: usize = 120;
     #[cfg(not(feature = "mem_report"))]
-    pub const COUNT: usize = 112;
+    pub const COUNT: usize = 116;
 }
 
 /// Original (pre-detour) libkernel entry points, indexed by `hook::*`, and

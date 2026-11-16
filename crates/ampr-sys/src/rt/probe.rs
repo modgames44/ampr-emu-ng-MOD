@@ -144,18 +144,7 @@ pub(crate) unsafe fn note_aio_submit(
 
 // ---- dup, poll, select --------------------------------------------------------
 
-type DupFn = unsafe extern "C" fn(c_int) -> c_int;
 type Dup2Fn = unsafe extern "C" fn(c_int, c_int) -> c_int;
-
-pub(crate) unsafe extern "C" fn dup_probe(fd: c_int) -> c_int {
-    let seen = unsafe { fd_path(fd) };
-    let rc = unsafe { kernel_slot::<DupFn>(sys::hook::dup) }
-        .map_or_else(posix_missing_original, |f| unsafe { f(fd) });
-    if let Some(t) = seen {
-        note_text(b'D', HOW_VIRTUAL, rc.into(), b"dup", &t);
-    }
-    rc
-}
 
 pub(crate) unsafe extern "C" fn dup2_probe(fd: c_int, fd2: c_int) -> c_int {
     let seen = unsafe { fd_path(fd).or_else(|| fd_path(fd2)) };
@@ -288,55 +277,7 @@ unsafe fn note_path(op: u8, dirfd: c_int, path: *const c_char, rc: i64) {
     }
 }
 
-/// `int openat(int, const char *, int, ...)`: the variadic mode arrives in
-/// the fourth integer register on SysV x86-64 (as `underscore_openat_emul`
-/// in rt/index.rs declares it).
-type OpenatFn = unsafe extern "C" fn(c_int, *const c_char, c_int, ...) -> c_int;
-type FstatatFn = unsafe extern "C" fn(c_int, *const c_char, *mut c_void, c_int) -> c_int;
-type FaccessatFn = unsafe extern "C" fn(c_int, *const c_char, c_int, c_int) -> c_int;
 type ReadlinkFn = unsafe extern "C" fn(*const c_char, *mut c_char, usize) -> isize;
-
-pub(crate) unsafe extern "C" fn openat_probe(
-    dirfd: c_int,
-    path: *const c_char,
-    flags: c_int,
-    mode: c_int,
-) -> c_int {
-    let rc = unsafe { kernel_slot::<OpenatFn>(sys::hook::openat) }
-        .map_or_else(posix_missing_original, |f| unsafe {
-            f(dirfd, path, flags, mode)
-        });
-    unsafe { note_path(b'T', dirfd, path, rc.into()) };
-    rc
-}
-
-pub(crate) unsafe extern "C" fn fstatat_probe(
-    dirfd: c_int,
-    path: *const c_char,
-    sb: *mut c_void,
-    flag: c_int,
-) -> c_int {
-    let rc = unsafe { kernel_slot::<FstatatFn>(sys::hook::fstatat) }
-        .map_or_else(posix_missing_original, |f| unsafe {
-            f(dirfd, path, sb, flag)
-        });
-    unsafe { note_path(b'F', dirfd, path, rc.into()) };
-    rc
-}
-
-pub(crate) unsafe extern "C" fn faccessat_probe(
-    dirfd: c_int,
-    path: *const c_char,
-    mode: c_int,
-    flag: c_int,
-) -> c_int {
-    let rc = unsafe { kernel_slot::<FaccessatFn>(sys::hook::faccessat) }
-        .map_or_else(posix_missing_original, |f| unsafe {
-            f(dirfd, path, mode, flag)
-        });
-    unsafe { note_path(b'C', dirfd, path, rc.into()) };
-    rc
-}
 
 pub(crate) unsafe extern "C" fn readlink_probe(
     path: *const c_char,

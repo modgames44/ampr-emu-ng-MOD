@@ -792,11 +792,23 @@ unsafe fn open_indexed_or_real(
         return Err(rc);
     }
     let mut handled = false;
+    // One path buffer for both uses below (the frame stays as it was:
+    // tools/check_stack_frames.py budgets hook-path frames).
+    let mut path: EntryPath = [0; ampr_format::source::PATH_BUF];
     let fd = unsafe { ampr_pack_try_open_indexed(id, &view, flags, mode, &mut handled) };
     if handled {
+        // An APR open of a stream (readahead.rs `stream_path`): one index
+        // path read, here only, to mark the fd for read-ahead.
+        if fd >= 0 {
+            if entry(&mut view, Some(&mut path)) == 0 && !view.path.is_null() {
+                let name = unsafe {
+                    core::slice::from_raw_parts(view.path.cast::<u8>(), view.path_length as usize)
+                };
+                unsafe { super::pack::ampr_pack_mark_stream_fd(fd, name) };
+            }
+        }
         return Ok(Some(fd));
     }
-    let mut path: EntryPath = [0; ampr_format::source::PATH_BUF];
     let rc = entry(&mut view, Some(&mut path));
     if rc != 0 || view.path.is_null() {
         return Err(if rc != 0 { rc } else { -ENOENT });

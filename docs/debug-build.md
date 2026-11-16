@@ -20,9 +20,11 @@ Only the debug build:
   ([Tune file](#tune-file)); release ignores the file;
 - records failed file calls for `/fsfail` and writes the black box
   `/data/ampr_emu_trace.txt`;
-- in a title with packs, installs pass-through probes (hook ids 112..=119:
-  dup, dup2, poll, select, openat, fstatat, faccessat, readlink) that log a
-  packed file or virtual fd reaching a call the runtime does not serve. A
+- in a title with packs, installs pass-through probes (hook ids 116..=119:
+  dup2, poll, select, readlink) that log a packed file or virtual fd
+  reaching a call the runtime does not serve (openat, fstatat, faccessat
+  and dup, ids 112..=115, are routed in both builds and log as `T F C`
+  path events). A
   libc hook (`_open`, `_openat`, `access`, `lstat`) whose
   `AMPR_ZSTD_LIBC_HOOKS` bit is clear still installs and only observes;
 - checks each zstd chunk's frame checksum (knob `zstd_verify`, default 1).
@@ -214,7 +216,8 @@ of `/metrics` and in the black box; the full list is at `FsEvents` in
 | `J` | An APR call that returned an error (first 64): lookup `w` wait, `u` submit, `n` native batch. |
 | `K` | A module load. Lookup `-`: the name the game asked for; `h`: the index path tried first after an ENOENT. |
 | `G` | A gather/scatter retry resolved to another file or offset. |
-| `D W T F C N` | Probes: dup, poll, openat, fstatat, faccessat, readlink reached a packed file (`p`), indexed directory (`d`) or virtual fd (`v`). |
+| `D W N` | Probes: dup2, poll, readlink reached a packed file (`p`), indexed directory (`d`) or virtual fd (`v`). |
+| `T F C` | The routed `openat`, `fstatat`, `faccessat` (both builds; logged in debug like `O s a`). |
 | `O A a l` with lookup `p` or `d` | A libc hook with its `AMPR_ZSTD_LIBC_HOOKS` bit clear saw a packed file or directory and did not route it. |
 | `I` | The game's own AIO submit on a packed fd, served by the runtime (logged whatever the result). |
 | `X Y` | mmap, `sceKernelMmap` of a virtual fd: lookup `k` disk cache file, `f` decode on access, `F` decode-on-access failure, `v` other failure. `/fsfail` keeps failures only. |

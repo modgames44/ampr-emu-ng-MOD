@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Notes for coding agents working on ampr-emu-ng (version 0.4.1, GPL-3.0-or-later).
+Notes for coding agents working on ampr-emu-ng (version 0.5.2, GPL-3.0-or-later; upstream base 0.4.1).
 
 ## Project
 
@@ -115,11 +115,34 @@ target (ceil(median x 1.5) + 1, at least 1). That EAGAIN
 starts pressure mode: idle threads leave at once, each group runs at most
 one thread while it has work and none without (decode workers never go
 below one, `LoadGroup::floor`), until 10 s pass with no new failure
-(`LoadGroup`, `pressure` in `rt/thread_hooks.rs`). Ids 112..=119 (dup,
-dup2, poll, select, openat, fstatat, faccessat, readlink) exist only in the
-debug build, as pass-through probes in titles with packs (`rt/probe.rs`).
-Pkg mode and a writable /app0 add no hook ids; the hook ids are as
-upstream. The
+(`LoadGroup`, `pressure` in `rt/thread_hooks.rs`). Ids 112..=115
+(openat, fstatat, faccessat, dup) install in both builds in titles with
+packs and route through the index and the virtual fds (`openat_emul` ..
+`dup_emul` in `rt/index.rs`; a relative path under a virtual directory fd
+is joined to it, `at_path`). Ids 116..=119 (dup2, poll, select, readlink)
+exist only in the debug build, as pass-through probes in titles with packs
+(`rt/probe.rs`). Pkg mode and a writable /app0 add no hook ids.
+At module_start, both builds write `/data/ampr_emu_status.txt` (version,
+mode, app0 rw/ro, hook rc, index ok/fail/skip, one `missing <symbol>` per
+hook that did not install; `write_status` in `rt/exports.rs`); kraken-mount
+reads it after each launch. Reads: a single-segment read()/pread() whose
+chunks are all Ready in the decoded cache is copied on the caller's thread
+(`read_cached_inline`, `rt/pack/fd_read.rs`); other reads go through the
+read threads, whose queue takes calls of at most 64 KiB first
+(`pop_prioritized`). A read that copies only part of a chunk is admitted to
+the decoded cache on its first touch (`cache_should_admit_locked`).
+Read-ahead (`AMPR_PACK_READAHEAD_CHUNKS`, default 4) runs only for streams
+(`AMPR_PACK_READAHEAD_HOT_ONLY`, default 1): files the manifest marks HOT,
+and fds opened on an audio/video file name (`stream_path` in
+`rt/pack/readahead.rs`, `VirtualFdSlot::stream`), in all three pack
+formats (zstd too: the read-ahead file view is `packed_read_file`). Such
+fds are also classed like HOT files (`classify_work`). One decode worker
+on top of `AMPR_PACK_WORKERS` is kept for reads of at most 64 KiB
+(`AMPR_PACK_LATENCY_RESERVE`, default 1; 4 + 1 workers fit the Buffer
+ledger with 11 pipelines), and the worker group grows when only reserved
+workers are idle and bulk jobs wait (`maybe_grow_workers_locked`).
+`O_RDWR` without O_CREAT/O_TRUNC/O_APPEND/O_EXCL on a packed file gets a
+read-only virtual fd (`pack_open_flags_supported`). The
 runtime creates its own threads through `create_internal`
 (the pre-detour slot). Save data (`rt/save.rs`) is hooked by NID in a loaded
 `libSceSaveData` module, not through the libkernel table, in every title

@@ -38,12 +38,13 @@ const PROT_RX: c_int = sys::SCE_KERNEL_PROT_CPU_READ | sys::SCE_KERNEL_PROT_CPU_
 const _: () = {
     assert!(PAGE % TRAMP_SIZE == 0 && SLOTS_PER_PAGE <= 32);
     assert!(POOL_COPY_PAGES <= 64 && TRAMP_PAGES == 4 + cfg!(feature = "mem_report") as usize);
-    // 10 game AIO slots 100..=109 and 2 thread-creation slots 110..=111 in
-    // both builds, and in debug builds the 8 probe slots 112..=119
-    // (rt/probe.rs). With the 5 external equeue hooks, the 3 save data hooks
-    // (rt/save.rs) and the 2 loader hooks that is 122 (release) or 130 (debug)
-    // trampolines: 4 pages x 32 slots = 128 in release, 5 pages = 160 in debug.
-    assert!(HOOK_COUNT == 112 + 8 * cfg!(feature = "mem_report") as usize);
+    // 10 game AIO slots 100..=109, 2 thread-creation slots 110..=111 and
+    // the 4 *at/dup slots 112..=115 in both builds, and in debug builds the
+    // 4 probe slots 116..=119 (rt/probe.rs). With the 5 external equeue
+    // hooks, the 3 save data hooks (rt/save.rs) and the 2 loader hooks that
+    // is 126 (release) or 130 (debug) trampolines: 4 pages x 32 slots = 128
+    // in release, 5 pages = 160 in debug.
+    assert!(HOOK_COUNT == 116 + 4 * cfg!(feature = "mem_report") as usize);
     assert!(HOOK_COUNT + EXT_COUNT + SAVE_COUNT + LOADER_COUNT <= TRAMP_PAGES * SLOTS_PER_PAGE);
 };
 
@@ -127,7 +128,8 @@ use super::equeue::{
 use super::index::{
     posix_access_emul, posix_lstat_emul, posix_open_emul, posix_rename_emul, posix_stat_emul,
     posix_unlink_emul, sceKernelCheckReachability_emul, sceKernelOpen_emul, sceKernelStat_emul,
-    underscore_open_emul, underscore_openat_emul,
+    underscore_open_emul, underscore_openat_emul, openat_emul, fstatat_emul, faccessat_emul,
+    dup_emul,
 };
 use super::pack::mmap::{mmap_emul, munmap_emul, sceKernelMmap_emul, sceKernelMunmap_emul};
 use super::pack::zstd_libc::{
@@ -329,23 +331,21 @@ hook_table! {
     // (rt/thread_hooks.rs).
     c"scePthreadCreate" => super::thread_hooks::scePthreadCreate_emul, O;
     c"pthread_create" => super::thread_hooks::pthread_create_emul, O;
+    // Both builds, titles with packs: the *at path calls and dup of a
+    // virtual pack fd (rt/index.rs); other calls reach their own original.
+    c"openat" => openat_emul, O;
+    c"fstatat" => fstatat_emul, O;
+    c"faccessat" => faccessat_emul, O;
+    c"dup" => dup_emul, O;
     // Debug, both pack formats: pass-through observers of APIs the runtime
     // does not serve for packed files (rt/probe.rs); each calls its own
     // original.
-    #[cfg(feature = "mem_report")]
-    c"dup" => probe::dup_probe, O;
     #[cfg(feature = "mem_report")]
     c"dup2" => probe::dup2_probe, O;
     #[cfg(feature = "mem_report")]
     c"poll" => probe::poll_probe, O;
     #[cfg(feature = "mem_report")]
     c"select" => probe::select_probe, O;
-    #[cfg(feature = "mem_report")]
-    c"openat" => probe::openat_probe, O;
-    #[cfg(feature = "mem_report")]
-    c"fstatat" => probe::fstatat_probe, O;
-    #[cfg(feature = "mem_report")]
-    c"faccessat" => probe::faccessat_probe, O;
     #[cfg(feature = "mem_report")]
     c"readlink" => probe::readlink_probe, O;
 }
@@ -1575,8 +1575,9 @@ pub(crate) const fn observed_only(id: usize) -> bool {
 /// bit (or, in debug builds, `observed_only`), 96 and 97
 /// need `AMPR_ZSTD_MMAP` on, 98 and 99 need it at 1 (rt/pack/mmap.rs),
 /// 100..=109 (the game's kernel AIO, rt/pack/aio.rs) need nothing more,
-/// 110..=111 (thread creation) install in every title, and 112..=119 exist
-/// only in debug builds (rt/probe.rs). The knobs keep their zstd names but
+/// 110..=111 (thread creation) install in every title, 112..=115 (*at, dup)
+/// need nothing more, and 116..=119 exist only in debug builds
+/// (rt/probe.rs). The knobs keep their zstd names but
 /// apply to both formats.
 fn hook_enabled(id: usize) -> bool {
     if id < FALLBACK_SHARED.len() {
@@ -1998,6 +1999,21 @@ unsafe fn install_all(lib: SceKernelModule) -> c_int {
 
 // ---- exports -------------------------------------------------------------------
 
+/// The status file (rt/exports.rs `write_status`): calls `f` with the
+/// symbol of every libkernel hook this title wanted (`hook_enabled`) that
+/// did not install, mandatory or optional. A missing optional hook used to
+/// leave no trace in the release build (a missing `read` hook leaves
+/// packed fds AIO-only, for one).
+pub(crate) unsafe fn for_each_missing_hook(mut f: impl FnMut(&'static core::ffi::CStr)) {
+    let _g = HOOK_LOCK.lock();
+    let st = unsafe { state() };
+    for i in 0..HOOK_COUNT {
+        if hook_enabled(i) && !st.hooks[i].installed {
+            f(HOOKS.0[i].symbol);
+        }
+    }
+}
+
 pub unsafe fn amprInstallLibkernelHooks() -> c_int {
     unsafe { install_all(LIBKERNEL) }
 }
@@ -2091,8 +2107,12 @@ mod tests {
                 id::sceKernelAioCancelRequests,
                 c"sceKernelAioCancelRequests",
             ),
-            #[cfg(feature = "mem_report")]
+            (id::openat, c"openat"),
+            (id::fstatat, c"fstatat"),
+            (id::faccessat, c"faccessat"),
             (id::dup, c"dup"),
+            #[cfg(feature = "mem_report")]
+            (id::dup2, c"dup2"),
             #[cfg(feature = "mem_report")]
             (id::readlink, c"readlink"),
             (id::scePthreadCreate, c"scePthreadCreate"),

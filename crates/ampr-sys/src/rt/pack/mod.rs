@@ -660,7 +660,7 @@ const _: () = assert!(
 );
 pub(crate) const AMPR_EMU_PACK_WORKER_CAPACITY: usize = 16;
 /// Sequential read-ahead window in chunks, from the Makefile's
-/// `AMPR_PACK_READAHEAD_CHUNKS` (Makefile default 0, off; 32, a ~1-1.5 MiB
+/// `AMPR_PACK_READAHEAD_CHUNKS` (Makefile default 4, HOT files only; 32, a ~1-1.5 MiB
 /// prefetch run, when built outside the Makefile); 0 disables read-ahead
 /// (readahead.rs).
 pub(crate) const AMPR_EMU_PACK_READAHEAD_CHUNKS: u32 =
@@ -679,6 +679,14 @@ pub(crate) const AMPR_EMU_PACK_READAHEAD_MAX_DISK_INFLIGHT: u32 =
         Some(s) if s.len() == 1 && s.as_bytes()[0] == b'0' => 0,
         Some(s) => super::runtime_memory::parse_size(s.as_bytes()) as u32,
         None => 2,
+    };
+/// `AMPR_PACK_READAHEAD_HOT_ONLY` (default 1): read-ahead only for files
+/// with `AMPR_PACK_FILE_HOT` (readahead.rs `readahead_window_locked`);
+/// "0" applies it to every packed file, as before.
+pub(crate) const AMPR_EMU_PACK_READAHEAD_HOT_ONLY: bool =
+    match option_env!("AMPR_PACK_READAHEAD_HOT_ONLY") {
+        Some(s) => !(s.len() == 1 && s.as_bytes()[0] == b'0'),
+        None => true,
     };
 pub(crate) const AMPR_EMU_PACK_DECODED_CACHE_MAX_BYTES: u64 = 512 * 1024 * 1024;
 /// Pipeline slots, from the Makefile's `AMPR_PACK_PIPELINES` (default 12,
@@ -704,7 +712,23 @@ const _: () = assert!(
 );
 pub(crate) const AMPR_EMU_PACK_WORKER_PRIORITY: c_int = 384;
 pub(crate) const AMPR_EMU_PACK_WORKER_AFFINITY: u64 = 0x3f;
-pub(crate) const AMPR_EMU_PACK_LATENCY_RESERVE_WORKERS: u32 = 0;
+/// Workers kept for the latency class (reads of at most 64 KiB), from the
+/// Makefile's `AMPR_PACK_LATENCY_RESERVE` (default 1; "0" for none). They
+/// come on top of AMPR_EMU_PACK_WORKERS at run time (state.rs: 4 + 1 ask
+/// for 5, which `buffer_split` fits with 11 pipelines in the same Buffer
+/// ledger). Applies only while more than one worker runs (schedule.rs
+/// `effective_latency_reserve_locked`).
+pub(crate) const AMPR_EMU_PACK_LATENCY_RESERVE_WORKERS: u32 =
+    match option_env!("AMPR_PACK_LATENCY_RESERVE") {
+        Some(s) if s.len() == 1 && s.as_bytes()[0] == b'0' => 0,
+        Some(s) => super::runtime_memory::parse_size(s.as_bytes()) as u32,
+        None => 1,
+    };
+const _: () = assert!(
+    AMPR_EMU_PACK_LATENCY_RESERVE_WORKERS < AMPR_EMU_PACK_WORKERS
+        && AMPR_EMU_PACK_WORKERS + AMPR_EMU_PACK_LATENCY_RESERVE_WORKERS
+            <= AMPR_EMU_PACK_WORKER_CAPACITY as u32
+);
 pub(crate) const AMPR_EMU_PACK_LATENCY_READ_MAX_BYTES: u64 = 64 * 1024;
 pub(crate) const AMPR_EMU_PACK_BULK_READ_MIN_BYTES: u64 = 256 * 1024;
 pub(crate) const AMPR_EMU_PACK_IO_STAGING_BYTES: u64 = 2 * 1024 * 1024;
@@ -893,6 +917,10 @@ pub(crate) struct VirtualFdSlot {
     pub readahead_next: u32,
     pub cursor: u64,
     pub active: bool,
+    /// The open path names an audio or video stream (readahead.rs
+    /// `stream_path`): read-ahead and the latency class as for a HOT file,
+    /// for zstd and dump-forge LZ4 packs, whose indexes carry no such flag.
+    pub stream: bool,
 }
 impl VirtualFdSlot {
     pub(crate) const EMPTY: Self = Self {
@@ -901,6 +929,7 @@ impl VirtualFdSlot {
         readahead_next: 0,
         cursor: 0,
         active: false,
+        stream: false,
     };
 
     /// Open and still the slot of `fd`. A closed slot that has been reused

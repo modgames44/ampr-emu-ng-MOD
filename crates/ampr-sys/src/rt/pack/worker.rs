@@ -442,7 +442,15 @@ unsafe fn spawn_worker_locked(state: *mut PackState, i: usize) -> bool {
 /// were prepared the ceiling is 0, so nothing starts here.
 pub(crate) unsafe fn maybe_grow_workers_locked(state: *mut PackState) {
     let live = WORKERS_LIVE.load(Ordering::Relaxed);
-    if WORKERS_IDLE.load(Ordering::Relaxed) != 0
+    // An idle latency-reserved worker never takes bulk work (schedule.rs):
+    // with bulk jobs queued it must not stop the group growing, or every
+    // bulk read waits for the one non-reserved worker. At most `reserve`
+    // idle workers may be reserved ones; more idle ones can take the job.
+    let idle = WORKERS_IDLE.load(Ordering::Relaxed);
+    let bulk_queued = (*state).queue_depth[work_class_index(PackWorkClass::Bulk) as usize] != 0;
+    let idle_blocks = idle != 0
+        && !(bulk_queued && idle <= unsafe { effective_latency_reserve_locked(state) });
+    if idle_blocks
         || live >= WORKERS_CEILING.load(Ordering::Relaxed)
         || WORKER_STOP_REQUESTED.load(Ordering::Acquire)
         || !WORKER_LOAD.may_grow(live)
@@ -1023,6 +1031,8 @@ mod tests {
     #[test]
     fn buffer_split_fits_the_buffer_cap() {
         assert_eq!(split(4, 12), (4, 12));
+        // The default latency reserve (4 + 1): one pipeline fewer, no memory added.
+        assert_eq!(split(4 + AMPR_EMU_PACK_LATENCY_RESERVE_WORKERS, 12), (5, 11));
         assert_eq!(split(8, 16), (8, 9));
         assert_eq!(split(16, 16), (9, 9));
         assert_eq!(split(1, 0), (0, 0));

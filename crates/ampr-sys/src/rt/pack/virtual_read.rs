@@ -378,7 +378,8 @@ unsafe fn acquire_task_decoded_chunk(
     let waiter = key_hash != 0 && pipeline.decoded_wait_key == key_hash;
     pipeline.decoded_wait_key = 0;
     prepare_cache_wait(pipeline, key_hash);
-    let mut cache = cache_acquire(chunk, file_flags, false, prefetch, waiter);
+    let partial = task.copy_length < chunk.raw_size;
+    let mut cache = cache_acquire(chunk, file_flags, false, prefetch, waiter, partial);
     if prefetch && cache.kind != CacheAcquireKind::Load {
         // Cached, being loaded, failed or no room: nothing to prefetch.
         cache_release(&mut cache.lease);
