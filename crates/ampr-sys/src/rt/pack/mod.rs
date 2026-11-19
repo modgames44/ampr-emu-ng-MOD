@@ -688,6 +688,18 @@ pub(crate) const AMPR_EMU_PACK_READAHEAD_HOT_ONLY: bool =
         Some(s) => !(s.len() == 1 && s.as_bytes()[0] == b'0'),
         None => true,
     };
+/// `AMPR_PACK_SEQ_RUN` (default 3; 0 disables): consecutive forward read
+/// batches after which a fd without a HOT flag or a stream name is read as a
+/// sequential stream and gets the prefetch window (readahead.rs
+/// `readahead_window_locked`). The gate under `AMPR_PACK_READAHEAD_HOT_ONLY`
+/// so a file read front to back (a level, a `.la`/`.pak` asset bundle whose
+/// extension is not in the stream list) is prefetched once the pattern is
+/// clear, while a random-access file never reaches the run and is left alone.
+pub(crate) const AMPR_EMU_PACK_SEQ_RUN: u32 = match option_env!("AMPR_PACK_SEQ_RUN") {
+    Some(s) if s.len() == 1 && s.as_bytes()[0] == b'0' => 0,
+    Some(s) => super::runtime_memory::parse_size(s.as_bytes()) as u32,
+    None => 3,
+};
 pub(crate) const AMPR_EMU_PACK_DECODED_CACHE_MAX_BYTES: u64 = 512 * 1024 * 1024;
 /// Pipeline slots, from the Makefile's `AMPR_PACK_PIPELINES` (default 12,
 /// at most AMPR_EMU_PACK_PIPELINE_MAX) in both builds: each pipeline keeps a
@@ -921,6 +933,14 @@ pub(crate) struct VirtualFdSlot {
     /// `stream_path`): read-ahead and the latency class as for a HOT file,
     /// for zstd and dump-forge LZ4 packs, whose indexes carry no such flag.
     pub stream: bool,
+    /// Highest local chunk the previous read batch touched in this fd's file,
+    /// or u32::MAX before the first read; readahead.rs sequential detection.
+    pub last_touched: u32,
+    /// Consecutive forward read batches on this fd (readahead.rs
+    /// `readahead_window_locked`). At `AMPR_EMU_PACK_SEQ_RUN` the fd is read as
+    /// a stream even without a HOT flag or a stream name, so a file read front
+    /// to back (a level, a `.la`/`.pak` bundle) gets the prefetch window too.
+    pub seq_run: u32,
 }
 impl VirtualFdSlot {
     pub(crate) const EMPTY: Self = Self {
@@ -930,6 +950,8 @@ impl VirtualFdSlot {
         cursor: 0,
         active: false,
         stream: false,
+        last_touched: u32::MAX,
+        seq_run: 0,
     };
 
     /// Open and still the slot of `fd`. A closed slot that has been reused

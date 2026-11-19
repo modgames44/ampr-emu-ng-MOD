@@ -1,6 +1,6 @@
 [package]
 name = "ampr-lz4"
-version = "0.5.4"
+version = "0.5.5"
 edition = "2021"
 license = "GPL-3.0-or-later"
 
@@ -10,4 +10,13 @@ name = "ampr_lz4"
 [dependencies]
 ampr-codec = { path = "../ampr-codec" }
 ampr-format = { path = "../ampr-format" }
-lz4_flex = { version = "=0.14.0", default-features = false, features = ["checked-decode"] }
+lz4_flex = { version = "=0.14.0", default-features = false }
+
+[features]
+default = ["checked-decode"]
+# lz4_flex's bounds guard over its unsafe decode: a corrupt chunk fails cleanly
+# instead of reading or writing out of bounds. On by default; dropping it
+# (fast-decode, no checked-decode) is a touch faster but unsafe on bad input.
+checked-decode = ["lz4_flex/checked-decode"]
+# Selected in place of checked-decode (never alongside it) for the fastest LZ4.
+fast-decode = []

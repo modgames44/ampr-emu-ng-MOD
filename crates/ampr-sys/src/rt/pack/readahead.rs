@@ -95,6 +95,19 @@ pub(crate) fn stream_path(path: &[u8]) -> bool {
     STREAM_EXTS.iter().any(|e| e.eq_ignore_ascii_case(ext))
 }
 
+/// Advances the sequential-run counter for a read batch whose highest chunk is
+/// `last` (previous high `prev`, u32::MAX before the first read; current run
+/// `run`; window `k`). A forward step (same chunk, or on past `prev` by at most
+/// the window) grows the run, anything else resets it. Returns the new run and
+/// whether the fd now reads as a sequential stream (run at AMPR_EMU_PACK_SEQ_RUN,
+/// which when 0 disables detection). Pure, so the window gate can be tested.
+fn seq_step(prev: u32, last: u32, run: u32, k: u32) -> (u32, bool) {
+    let forward = prev == u32::MAX || (last >= prev && last - prev <= k + 1);
+    let run = if forward { run.saturating_add(1) } else { 0 };
+    let sequential = AMPR_EMU_PACK_SEQ_RUN != 0 && run >= AMPR_EMU_PACK_SEQ_RUN;
+    (run, sequential)
+}
+
 /// The read-ahead view of packed file `file_id`, both formats: its task
 /// file, logical size, chunk shift, chunk count and flags (zstd: none).
 unsafe fn readahead_file(
@@ -149,9 +162,20 @@ pub(crate) unsafe fn readahead_window_locked(
         stats::add(stats::Stat::PrefetchSkipped, end.saturating_sub(last + 1));
         return (0, 0);
     }
-    // Only marked streams (audio, video) by default: other files keep the
-    // measured "off" (Makefile AMPR_PACK_READAHEAD_HOT_ONLY).
-    if AMPR_EMU_PACK_READAHEAD_HOT_ONLY && flags & AMPR_PACK_FILE_HOT == 0 && !slot.stream {
+    // Sequential-run detection: a fd whose read batches keep moving forward
+    // through its file is a stream, whatever its extension. `last` is the
+    // highest chunk this batch read; a forward step (same chunk, or on past
+    // the previous high by no more than the window) grows the run, anything
+    // else resets it. At AMPR_EMU_PACK_SEQ_RUN the fd prefetches like a HOT
+    // file, so a level file or a `.la`/`.pak` asset bundle read front to back
+    // is covered while a random-access file never reaches the run.
+    let (run, sequential) = seq_step(slot.last_touched, last as u32, slot.seq_run, k as u32);
+    slot.seq_run = run;
+    slot.last_touched = last as u32;
+    // Only marked streams (audio, video) and detected sequential fds by
+    // default: other files keep the measured "off" (Makefile
+    // AMPR_PACK_READAHEAD_HOT_ONLY).
+    if AMPR_EMU_PACK_READAHEAD_HOT_ONLY && flags & AMPR_PACK_FILE_HOT == 0 && !slot.stream && !sequential {
         return (0, 0);
     }
     let next = slot.readahead_next as u64;
@@ -381,7 +405,34 @@ pub(crate) unsafe fn bench_volume_path(out: &mut [u8; 1024]) -> Option<(usize, u
 
 #[cfg(test)]
 mod tests {
-    use super::stream_path;
+    use super::{seq_step, stream_path, AMPR_EMU_PACK_SEQ_RUN};
+
+    #[test]
+    fn sequential_run_opens_after_threshold_and_resets_on_jump() {
+        assert_eq!(AMPR_EMU_PACK_SEQ_RUN, 3, "test assumes the default run");
+        let k = 32;
+        // Front-to-back reads: the run grows and the window opens at the third.
+        let (r1, s1) = seq_step(u32::MAX, 0, 0, k);
+        assert_eq!((r1, s1), (1, false));
+        let (r2, s2) = seq_step(0, 1, r1, k);
+        assert_eq!((r2, s2), (2, false));
+        let (r3, s3) = seq_step(1, 2, r2, k);
+        assert_eq!((r3, s3), (3, true));
+        // A step within the window keeps the stream.
+        let (_r4, s4) = seq_step(2, 2 + k, r3, k);
+        assert!(s4);
+    }
+
+    #[test]
+    fn random_access_never_reaches_the_run() {
+        let k = 32;
+        // Backwards and far-forward jumps keep resetting the run to 0.
+        let (r1, _) = seq_step(u32::MAX, 100, 0, k);
+        let (r2, s2) = seq_step(100, 5, r1, k); // backward
+        assert_eq!((r2, s2), (0, false));
+        let (r3, s3) = seq_step(5, 5 + k + 2, r2, k); // forward past the window
+        assert_eq!((r3, s3), (0, false));
+    }
 
     #[test]
     fn stream_names_by_extension() {

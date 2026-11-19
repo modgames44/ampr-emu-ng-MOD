@@ -159,6 +159,15 @@ AMPR_ZSTD_MMAP ?= 2
 AMPR_PACK_READAHEAD_CHUNKS ?= 4
 AMPR_PACK_READAHEAD_HOT_ONLY ?= 1
 AMPR_PACK_READAHEAD_MAX_DISK_INFLIGHT ?= 2
+# Consecutive forward read batches after which a fd with no stream name and no
+# HOT flag is read as a sequential stream and gets the read-ahead window
+# (rt/pack/readahead.rs). Covers a file read front to back whose extension is
+# not in the stream list (a level, a `.la`/`.pak` asset bundle); 0 disables it.
+AMPR_PACK_SEQ_RUN ?= 3
+# 1 = drop lz4_flex's bounds guard for the fastest LZ4 decode (cargo feature
+# lz4_fast). Only for trusted storage: a corrupt chunk then reads/writes out of
+# bounds instead of failing cleanly. No effect on pkg (Kraken) or zstd games.
+AMPR_LZ4_FAST ?= 0
 # Git revision in the debug build's /metrics (rt/exports.rs BUILD_REV):
 # short hash, "-dirty" with uncommitted tracked changes. ps5/build-docker.sh
 # sets it from the host, since the Docker image has no git.
@@ -175,7 +184,11 @@ AMPR_BETA ?= 0
 BUILD_KNOBS := AMPR_MEM_REPORT AMPR_INTERNAL_POOL_SIZE AMPR_DEBUG_POOL_SIZE \
   AMPR_PACK_WORKERS AMPR_PACK_LATENCY_RESERVE AMPR_PACK_PIPELINES AMPR_ZSTD_LIBC_HOOKS AMPR_ZSTD_MMAP \
   AMPR_PACK_READAHEAD_CHUNKS AMPR_PACK_READAHEAD_MAX_DISK_INFLIGHT \
-  AMPR_PACK_READAHEAD_HOT_ONLY AMPR_GIT_REV AMPR_BETA
+  AMPR_PACK_READAHEAD_HOT_ONLY AMPR_PACK_SEQ_RUN AMPR_LZ4_FAST AMPR_GIT_REV AMPR_BETA
+
+# Cargo features: lz4_checked (default) or lz4_fast, plus mem_report (debug).
+comma := ,
+CARGO_FEATURES := $(if $(filter 1,$(AMPR_LZ4_FAST)),lz4_fast,lz4_checked)$(if $(filter 1,$(AMPR_MEM_REPORT)),$(comma)mem_report)
 $(foreach k,$(BUILD_KNOBS),$(if $(filter 1,$(words $($(k)))),,\
   $(error $(k) must be one word, got '$($(k))'; pass each knob as its own argument)))
 
@@ -244,6 +257,8 @@ $(BUILD_CONFIG): FORCE
 	  printf '%s\n' 'AMPR_PACK_READAHEAD_CHUNKS=$(AMPR_PACK_READAHEAD_CHUNKS)'; \
 	  printf '%s\n' 'AMPR_PACK_READAHEAD_MAX_DISK_INFLIGHT=$(AMPR_PACK_READAHEAD_MAX_DISK_INFLIGHT)'; \
 	  printf '%s\n' 'AMPR_PACK_READAHEAD_HOT_ONLY=$(AMPR_PACK_READAHEAD_HOT_ONLY)'; \
+	  printf '%s\n' 'AMPR_PACK_SEQ_RUN=$(AMPR_PACK_SEQ_RUN)'; \
+	  printf '%s\n' 'AMPR_LZ4_FAST=$(AMPR_LZ4_FAST)'; \
 	  printf '%s\n' 'AMPR_GIT_REV=$(AMPR_GIT_REV)'; \
 	  printf '%s\n' 'AMPR_BETA=$(AMPR_BETA)'; \
 	  printf '%s\n' 'PRX_LDFLAGS=$(PRX_LDFLAGS)'; \
@@ -261,9 +276,9 @@ RUST_SOURCES := $(wildcard crates/*/src/*.rs crates/*/src/*/*.rs crates/*/src/*/
 
 $(RUST_STATICLIB): Cargo.toml Cargo.lock $(RUST_SOURCES) $(RUST_TARGET) $(BUILD_MAKEFILE) $(BUILD_CONFIG)
 	CC_x86_64_ps5_freebsd=$(PS5_PAYLOAD_SDK)/bin/prospero-clang AR_x86_64_ps5_freebsd=$(PS5_PAYLOAD_SDK)/bin/prospero-ar CRATE_CC_NO_DEFAULTS=1 CFLAGS_x86_64_ps5_freebsd="$(ZSTD_CFLAGS)" \
-	RUSTC_BOOTSTRAP=1 AMPR_INTERNAL_POOL_SIZE=$(AMPR_INTERNAL_POOL_SIZE) AMPR_PACK_WORKERS=$(AMPR_PACK_WORKERS) AMPR_PACK_LATENCY_RESERVE=$(AMPR_PACK_LATENCY_RESERVE) AMPR_PACK_PIPELINES=$(AMPR_PACK_PIPELINES) AMPR_ZSTD_LIBC_HOOKS=$(AMPR_ZSTD_LIBC_HOOKS) AMPR_ZSTD_MMAP=$(AMPR_ZSTD_MMAP) AMPR_PACK_READAHEAD_CHUNKS=$(AMPR_PACK_READAHEAD_CHUNKS) AMPR_PACK_READAHEAD_MAX_DISK_INFLIGHT=$(AMPR_PACK_READAHEAD_MAX_DISK_INFLIGHT) AMPR_PACK_READAHEAD_HOT_ONLY=$(AMPR_PACK_READAHEAD_HOT_ONLY) AMPR_GIT_REV=$(AMPR_GIT_REV) AMPR_BETA=$(AMPR_BETA) CARGO_TARGET_DIR=$(abspath $(OUT)/cargo) \
+	RUSTC_BOOTSTRAP=1 AMPR_INTERNAL_POOL_SIZE=$(AMPR_INTERNAL_POOL_SIZE) AMPR_PACK_WORKERS=$(AMPR_PACK_WORKERS) AMPR_PACK_LATENCY_RESERVE=$(AMPR_PACK_LATENCY_RESERVE) AMPR_PACK_PIPELINES=$(AMPR_PACK_PIPELINES) AMPR_ZSTD_LIBC_HOOKS=$(AMPR_ZSTD_LIBC_HOOKS) AMPR_ZSTD_MMAP=$(AMPR_ZSTD_MMAP) AMPR_PACK_READAHEAD_CHUNKS=$(AMPR_PACK_READAHEAD_CHUNKS) AMPR_PACK_READAHEAD_MAX_DISK_INFLIGHT=$(AMPR_PACK_READAHEAD_MAX_DISK_INFLIGHT) AMPR_PACK_READAHEAD_HOT_ONLY=$(AMPR_PACK_READAHEAD_HOT_ONLY) AMPR_PACK_SEQ_RUN=$(AMPR_PACK_SEQ_RUN) AMPR_GIT_REV=$(AMPR_GIT_REV) AMPR_BETA=$(AMPR_BETA) CARGO_TARGET_DIR=$(abspath $(OUT)/cargo) \
 	  $(RUST_CARGO) build -Z build-std=core,alloc -Z json-target-spec \
-	    --release --target $(RUST_TARGET) -p ampr-sys $(if $(filter 1,$(AMPR_MEM_REPORT)),--features mem_report)
+	    --release --target $(RUST_TARGET) -p ampr-sys --no-default-features --features $(CARGO_FEATURES)
 
 # One relocatable object, so references between archive members do not count as imports.
 $(COMBINED_OBJ): $(RUST_STATICLIB)
