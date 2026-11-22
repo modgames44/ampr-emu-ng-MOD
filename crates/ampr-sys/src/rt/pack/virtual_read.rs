@@ -15,6 +15,234 @@ unsafe fn timed_copy(src: *const u8, dst: *mut u8, len: usize) {
     stats::add(stats::Stat::CopyBytes, len as u64);
 }
 
+// ---- game destinations ----
+//
+// A pack read writes the game's buffer with the CPU, by a copy or by a
+// decode straight into it, where kernel AIO and retail AMPR write it from
+// the kernel and answer EFAULT for a page that is not mapped. A title that
+// maps its streaming memory with AMM commands, which execute
+// asynchronously, can submit a read before its destination pages exist: a
+// zstd title faulted a pack worker in this copy 1.6 ms after submitting a
+// 256 KiB read whose middle 192 KiB was not mapped yet (core dump). The
+// reactor already waits out such a read (reactor/capacity.rs,
+// AMPR_EMU_APR_AIO_AMM_EFAULT_RETRY_*); a pack task waits the same way
+// before it writes, and fails the read with EFAULT when the destination is
+// still missing after the retries.
+//
+// The rest of the read's destination, from the current task on, is checked
+// once per pass with no decoded chunk lease held: a wait must not park the
+// jobs waiting on a chunk, and one that runs out must not publish EFAULT
+// into it. Task destinations rise with the task index, so that range holds
+// every later write of the pass. The deadline lives in the pipeline (one
+// per job), so a read of N tasks waits at most 640 ms, not N x 640.
+//
+// The check asks sceKernelQueryMemoryProtection per mapping. A setup whose
+// kernel refuses to describe mappings at all (EACCES for every query,
+// `sys::query_protection_is_blind`) probes each page
+// instead with a syscall that copies 16 bytes out into it
+// (sceKernelClockGetres), which returns an error for a page the game cannot
+// write where the CPU copy would fault. A protection is per page, so one
+// probe per page answers for the whole page.
+
+/// One sceKernelQueryMemoryProtection answer in a walk over a destination.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DestinationStep {
+    /// Mapped CPU-writable up to this address (exclusive).
+    MappedTo(usize),
+    /// Unmapped, not CPU-writable, or an answer that does not contain the
+    /// address.
+    Missing,
+    /// The kernel refused to describe the mapping (EACCES): the page is
+    /// probed instead (`destination_probe_at`).
+    Refused,
+}
+
+/// Bytes one probe writes: the `SceKernelTimespec` sceKernelClockGetres
+/// copies out.
+const DESTINATION_PROBE_BYTES: usize = 16;
+
+fn destination_step(answer: Option<sys::MemoryMapping>, addr: usize) -> DestinationStep {
+    let Some(mapping) = answer else {
+        return DestinationStep::Missing;
+    };
+    if mapping.rc == SCE_KERNEL_ERROR_EACCES {
+        return DestinationStep::Refused;
+    }
+    // CPU_RW is its own bit (0x02); a game's writable memory reports it.
+    if mapping.contains(addr, SCE_KERNEL_PROT_CPU_RW) {
+        DestinationStep::MappedTo(mapping.end_exclusive())
+    } else {
+        DestinationStep::Missing
+    }
+}
+
+/// Where a probe of the page holding `addr` writes, inside `[dst, last)`
+/// (the probe overwrites bytes the read is about to write, never one outside
+/// it), and where the walk goes on once it succeeds. None when the
+/// destination is too short to hold a probe: nothing can be written through
+/// the kernel without going outside it, so a read under 16 bytes stays
+/// unchecked as it was before the check existed.
+fn destination_probe_at(dst: usize, last: usize, addr: usize) -> Option<(usize, usize)> {
+    if last - dst < DESTINATION_PROBE_BYTES {
+        return None;
+    }
+    let at = addr.min(last - DESTINATION_PROBE_BYTES);
+    // Every page the probe touches is checked by it.
+    let next = ((at + DESTINATION_PROBE_BYTES - 1) | (SCE_KERNEL_PAGE_SIZE - 1)) + 1;
+    Some((at, next.min(last)))
+}
+
+/// Whether `[dst, dst + len)` is mapped CPU-writable: one `query` per
+/// mapping it spans (`query(addr)` returns the mapping of `addr`), and one
+/// `probe(at)` per page a refused query does not describe (`probe` writes
+/// DESTINATION_PROBE_BYTES at `at` through the kernel and says whether it
+/// could). `blind` skips the queries (every one is refused) and probes each
+/// page; `refused` counts the refused answers.
+fn destination_covered(
+    dst: usize,
+    len: usize,
+    blind: bool,
+    mut query: impl FnMut(usize) -> Option<sys::MemoryMapping>,
+    mut probe: impl FnMut(usize) -> bool,
+    refused: &mut u32,
+) -> bool {
+    let Some(last) = dst.checked_add(len) else {
+        return false;
+    };
+    let mut addr = dst;
+    // A refused answer on this title means the query cannot describe the
+    // page, and the next page is likely the same: probe the rest instead of
+    // paying a query per page (one zstd title answered EACCES 1.38M times in
+    // one session).
+    let mut probe_only = blind;
+    while addr < last {
+        let step = if probe_only {
+            DestinationStep::Refused
+        } else {
+            let step = destination_step(query(addr), addr);
+            if step == DestinationStep::Refused {
+                *refused += 1;
+                probe_only = true;
+            }
+            step
+        };
+        match step {
+            // `addr < next` holds: the step only maps answers containing addr.
+            DestinationStep::MappedTo(next) => addr = next,
+            DestinationStep::Missing => return false,
+            DestinationStep::Refused => {
+                let Some((at, next)) = destination_probe_at(dst, last, addr) else {
+                    return true;
+                };
+                if !probe(at) {
+                    return false;
+                }
+                addr = next;
+            }
+        }
+    }
+    true
+}
+
+static CLOCK_GETRES: crate::rt::sys::LazySym =
+    crate::rt::sys::LazySym::new(c"sceKernelClockGetres");
+type ClockGetresFn = unsafe extern "C" fn(SceKernelClockid, *mut SceKernelTimespec) -> c_int;
+
+/// `destination_covered` asked of libkernel. True without the query, as
+/// before the check existed; a refused page with no sceKernelClockGetres
+/// goes ahead unchecked too.
+fn destination_mapped(dst: *mut u8, len: usize) -> bool {
+    if !sys::memory_query_available() {
+        return true;
+    }
+    let Some(getres) = (unsafe { CLOCK_GETRES.get::<ClockGetresFn>() }) else {
+        return true;
+    };
+    let mut refused = 0u32;
+    let mapped = destination_covered(
+        dst as usize,
+        len,
+        sys::query_protection_is_blind(),
+        sys::query_memory_mapping,
+        // CLOCK_REALTIME (0): the kernel copies the resolution out to `at`
+        // and answers an error when it cannot.
+        |at| unsafe { getres(0, at as *mut SceKernelTimespec) } == 0,
+        &mut refused,
+    );
+    if refused != 0 {
+        stats::add(stats::Stat::PackDestQueryDenied, refused as u64);
+    }
+    mapped
+}
+
+/// Waits on this worker for `[dst, dst + len)` to be mapped, with no lease
+/// held, up to
+/// one deadline per job: AMPR_EMU_APR_AIO_AMM_EFAULT_RETRY_LIMIT sleeps of
+/// the reactor's AMM retry delay (64 x 10 ms). The deadline lives in the
+/// pipeline, which one job owns. A missing destination is rare (debug
+/// `pack_dest_waits`), so the worker sleeps rather than parking the job on a
+/// timer the scheduler does not have; the other workers keep running.
+/// Err(ECANCELED) on a cancel or stop, Err(EFAULT) when the deadline passes
+/// (debug `pack_dest_faults`). Only the gap between the last check and the
+/// write stays unchecked, as in the reactor's check.
+#[inline(never)]
+fn ensure_destination(
+    job: &VirtualAioSlot,
+    pipeline: &mut ReadPipelineContext,
+    dst: *mut u8,
+    len: usize,
+) -> Result<(), c_int> {
+    if len == 0 || pipeline.dest_checked {
+        return Ok(());
+    }
+    if destination_mapped(dst, len) {
+        pipeline.dest_checked = true;
+        return Ok(());
+    }
+    let limit = u64::from(reactor::AMPR_EMU_APR_AIO_AMM_EFAULT_RETRY_LIMIT);
+    let deadline = match pipeline.dest_deadline_ns {
+        0 => {
+            // Counted once per job, not once per task.
+            stats::add(stats::Stat::PackDestWaits, 1);
+            let deadline = sys::monotonic_ns().saturating_add(
+                reactor::AMPR_EMU_APR_AIO_AMM_EFAULT_RETRY_DELAY_NS * limit,
+            );
+            pipeline.dest_deadline_ns = deadline;
+            deadline
+        }
+        deadline => deadline,
+    };
+    // The deadline bounds the wait when the clock works; the count bounds it
+    // when it does not (monotonic_ns answers 0 on failure, which would keep
+    // `now < deadline` true forever).
+    let mut sleeps = 0u64;
+    loop {
+        if job.cancel_requested.load(Ordering::Acquire)
+            || WORKER_STOP_REQUESTED.load(Ordering::Acquire)
+        {
+            return Err(SCE_KERNEL_ERROR_ECANCELED);
+        }
+        let now = sys::monotonic_ns();
+        if now >= deadline || sleeps >= limit {
+            stats::add(stats::Stat::PackDestFaults, 1);
+            return Err(SCE_KERNEL_ERROR_EFAULT);
+        }
+        let sleep_ns = (deadline - now).min(reactor::AMPR_EMU_APR_AIO_AMM_EFAULT_RETRY_DELAY_NS);
+        sleeps += 1;
+        unsafe { sceKernelUsleep((sleep_ns / 1000) as _) };
+        // A cancel during the last sleep is a cancel, not EFAULT.
+        if job.cancel_requested.load(Ordering::Acquire)
+            || WORKER_STOP_REQUESTED.load(Ordering::Acquire)
+        {
+            return Err(SCE_KERNEL_ERROR_ECANCELED);
+        }
+        if destination_mapped(dst, len) {
+            pipeline.dest_checked = true;
+            return Ok(());
+        }
+    }
+}
+
 /// The `file` argument of `ampr_pack_core_task_count` and
 /// `ampr_pack_core_make_task`: an AMPRPAK4 record copied out of the
 /// manifest (it is not resident), or the zstd extent taken from the view.
@@ -86,21 +314,7 @@ pub(crate) unsafe fn cleanup_pipeline_continuation(
 ) {
     unsafe {
         if pipeline.decoded_lease.entry != INVALID_INDEX {
-            // A failed read-ahead drops its entry (transient error), so a later
-            // game read of the chunk loads it again instead of seeing Failed.
-            // Read through the raw state pointer: `pipeline` lives inside PackState.
-            let owner = pipeline.owner;
-            let prefetch = owner != INVALID_INDEX
-                && (*pack_state_create()).virtual_aio[owner as usize].prefetch_chunks != 0;
-            cache_publish(
-                &mut pipeline.decoded_lease,
-                if prefetch {
-                    SCE_KERNEL_ERROR_EAGAIN
-                } else {
-                    error
-                },
-            );
-            cache_release(&mut pipeline.decoded_lease);
+            cache_publish_and_release(&mut pipeline.decoded_lease, error);
         }
         if pipeline.pack_fd >= 0 && !pipeline.native_accepted {
             release_pack_fd(pipeline.io_range.pack_id);
@@ -207,10 +421,7 @@ pub(crate) unsafe fn advance_virtual_read_aio(
             PipelineStep::Failed
         };
         let state = pack_state();
-        // A read-ahead job (readahead.rs) has no result or destination: it only loads
-        // missing chunks into the decoded cache and skips every other chunk.
-        let prefetch = job.prefetch_chunks != 0;
-        if (job.request.result.is_null() && !prefetch) || job.request.offset < 0 {
+        if job.request.result.is_null() || job.request.offset < 0 {
             return set_error(SCE_KERNEL_ERROR_EINVAL);
         }
         let (task_file, logical_size, file_flags) = match try_packed_read_file(state, job.file_id) {
@@ -223,7 +434,7 @@ pub(crate) unsafe fn advance_virtual_read_aio(
         if job.request.nbyte == 0 || offset >= logical_size {
             return PipelineStep::Complete;
         }
-        if job.request.buf.is_null() && !prefetch {
+        if job.request.buf.is_null() {
             return set_error(SCE_KERNEL_ERROR_EFAULT);
         }
         // Task destination offsets are u32: a read of 4 GiB or more is cut
@@ -243,6 +454,8 @@ pub(crate) unsafe fn advance_virtual_read_aio(
             }
         }
         let output = job.request.buf as *mut u8;
+        // One destination check per pass (see "game destinations").
+        pipeline.dest_checked = false;
         while pipeline.task_index < pipeline.task_count {
             if job.cancel_requested.load(Ordering::Acquire) {
                 return fail_virtual_read(pipeline, SCE_KERNEL_ERROR_ECANCELED, error_out);
@@ -263,9 +476,20 @@ pub(crate) unsafe fn advance_virtual_read_aio(
                 return fail_virtual_read(pipeline, SCE_KERNEL_ERROR_EIO, error_out);
             }
             let chunk = task.chunk;
+            // The rest of the destination, from this task on (see "game
+            // destinations").
+            let rest = (
+                output.add(task.destination_offset as usize),
+                (length - task.destination_offset as u64) as usize,
+            );
             if pipeline.decoded_lease.entry == INVALID_INDEX {
+                // Before taking a lease: a wait must not hold an entry other
+                // jobs wait on.
+                if let Err(error) = ensure_destination(job, pipeline, rest.0, rest.1) {
+                    return fail_virtual_read(pipeline, error, error_out);
+                }
                 match acquire_task_decoded_chunk(
-                    pipeline, &chunk, &task, file_flags, prefetch, output, error_out,
+                    pipeline, &chunk, &task, file_flags, output, error_out,
                 ) {
                     Ok(true) => {
                         pipeline.task_index += 1;
@@ -278,17 +502,23 @@ pub(crate) unsafe fn advance_virtual_read_aio(
 
             if !pipeline_window_contains(pipeline, &chunk) {
                 if let Some(step) = prepare_exact_task_window(
-                    state, pipeline, file_ptr, offset, length, &chunk, prefetch, error_out,
+                    state, pipeline, file_ptr, offset, length, &chunk, error_out,
                 ) {
                     return step;
                 }
             }
 
-            let decode_rc =
-                decode_task_chunk(state, worker, pipeline, &chunk, &task, prefetch, output);
+            let (decode_rc, copied) =
+                decode_task_chunk(state, worker, pipeline, &chunk, &task, output, rest);
             if decode_rc != 0 {
                 note_decode_error(job.file_id, task.chunk_index, &chunk, decode_rc);
                 return fail_virtual_read(pipeline, decode_rc, error_out);
+            }
+            if !copied {
+                // The destination went missing while the lease was held: the
+                // chunk is published, and the task runs again from the top,
+                // where the wait holds no lease and the copy is a cache hit.
+                continue;
             }
             pipeline.task_index += 1;
         }
@@ -359,8 +589,8 @@ unsafe fn finish_virtual_read_native_io(
 }
 
 /// Looks the task's chunk up in the decoded cache: a hit is copied out, a
-/// miss takes the loader lease. Ok(true) when the task is finished (copied,
-/// or nothing to prefetch), Ok(false) when the chunk must be decoded,
+/// miss takes the loader lease. Ok(true) when the task is finished (copied),
+/// Ok(false) when the chunk must be decoded,
 /// Err(step) to return.
 #[allow(clippy::too_many_arguments)]
 unsafe fn acquire_task_decoded_chunk(
@@ -368,7 +598,6 @@ unsafe fn acquire_task_decoded_chunk(
     chunk: &AmprPackChunkView,
     task: &AmprPackBlockReadTask,
     file_flags: u32,
-    prefetch: bool,
     output: *mut u8,
     error_out: *mut c_int,
 ) -> Result<bool, PipelineStep> {
@@ -378,31 +607,23 @@ unsafe fn acquire_task_decoded_chunk(
     let waiter = key_hash != 0 && pipeline.decoded_wait_key == key_hash;
     pipeline.decoded_wait_key = 0;
     prepare_cache_wait(pipeline, key_hash);
-    let partial = task.copy_length < chunk.raw_size;
-    let mut cache = cache_acquire(chunk, file_flags, false, prefetch, waiter, partial);
-    if prefetch && cache.kind != CacheAcquireKind::Load {
-        // Cached, being loaded, failed or no room: nothing to prefetch.
-        cache_release(&mut cache.lease);
-        return Ok(true);
-    }
+    let full_chunk = task.source_offset == 0 && task.copy_length == chunk.raw_size;
+    let mut cache = cache_acquire(chunk, file_flags, full_chunk, waiter);
     // Pending retries the lookup after the loader publishes; count the final kind only.
     match cache.kind {
         CacheAcquireKind::Load | CacheAcquireKind::Bypass => {
             let repeat =
                 cfg!(feature = "mem_report") && stats::chunk_seen_before(chunk_key_hash(chunk));
-            if !prefetch {
-                stats::add(stats::Stat::CacheMisses, 1);
-                stats::add(
-                    if repeat {
-                        stats::Stat::CacheMissRepeat
-                    } else {
-                        stats::Stat::CacheMissFirst
-                    },
-                    1,
-                );
-            }
+            stats::add(stats::Stat::CacheMisses, 1);
+            stats::add(
+                if repeat {
+                    stats::Stat::CacheMissRepeat
+                } else {
+                    stats::Stat::CacheMissFirst
+                },
+                1,
+            );
         }
-        _ if prefetch => {}
         CacheAcquireKind::Ready => stats::add(stats::Stat::CacheHits, 1),
         CacheAcquireKind::Pending | CacheAcquireKind::Failed => {}
     }
@@ -461,7 +682,6 @@ unsafe fn prepare_exact_task_window(
     logical_offset: u64,
     logical_length: u64,
     chunk: &AmprPackChunkView,
-    prefetch: bool,
     error_out: *mut c_int,
 ) -> Option<PipelineStep> {
     unsafe {
@@ -506,7 +726,7 @@ unsafe fn prepare_exact_task_window(
             pack_id: chunk.pack_id,
         };
         let mut prepare_error = 0;
-        let prepared = prepare_exact_window_aio(&range, pipeline, prefetch, &mut prepare_error);
+        let prepared = prepare_exact_window_aio(&range, pipeline, &mut prepare_error);
         if matches!(
             prepared,
             PipelineStep::YieldIo | PipelineStep::YieldCache | PipelineStep::YieldFd
@@ -522,7 +742,9 @@ unsafe fn prepare_exact_task_window(
 
 /// Decodes the task's chunk from the bound window into the loader lease, the
 /// destination or the worker scratch, publishes a loader lease and copies
-/// the task's bytes out. Returns the decode result.
+/// the task's bytes out. Returns `(decode_rc, copied)`: `copied` is false
+/// when a loader lease's destination (`rest`, rechecked without a wait) was
+/// missing, so the chunk was published without the copy.
 #[allow(clippy::too_many_arguments)]
 unsafe fn decode_task_chunk(
     state: *mut PackState,
@@ -530,9 +752,9 @@ unsafe fn decode_task_chunk(
     pipeline: &mut ReadPipelineContext,
     chunk: &AmprPackChunkView,
     task: &AmprPackBlockReadTask,
-    prefetch: bool,
     output: *mut u8,
-) -> c_int {
+    rest: (*mut u8, usize),
+) -> (c_int, bool) {
     let cache_loader = pipeline.decoded_lease.entry != INVALID_INDEX;
     let decoded = if cache_loader {
         pipeline.decoded_lease.data
@@ -569,29 +791,38 @@ unsafe fn decode_task_chunk(
     } else {
         stats::add(stats::Stat::DecodeErrors, 1);
     }
+    let mut copied = true;
     if cache_loader {
-        let publish_rc = if prefetch && decode_rc != 0 {
-            SCE_KERNEL_ERROR_EAGAIN
-        } else {
-            decode_rc
-        };
-        let waited = cache_publish(&mut pipeline.decoded_lease, publish_rc);
-        if waited || prefetch {
-            // Requeue game reads parked on this chunk now, not after the whole run.
-            let g = PACK_M.lock();
-            if wake_cache_waiters_locked(state) {
-                drop(g);
-                QUEUE_CV.notify_all();
+        // Copy out before publishing: the publish drops the loader's pin in
+        // the same CACHE_MUTEX section, so the entry may be evicted after
+        // it. Readers parked on the chunk wait the copy longer.
+        if decode_rc == 0 {
+            // The lease was taken before a window read, so the destination
+            // is rechecked here, after the yield, without a wait: readers
+            // parked on the chunk must not wait it out too.
+            if !pipeline.dest_checked && !destination_mapped(rest.0, rest.1) {
+                copied = false;
+            } else {
+                pipeline.dest_checked = true;
+                timed_copy(
+                    pipeline.decoded_lease.data.add(task.source_offset as usize),
+                    output.add(task.destination_offset as usize),
+                    task.copy_length as usize,
+                );
             }
         }
-        if decode_rc == 0 && !prefetch {
-            timed_copy(
-                pipeline.decoded_lease.data.add(task.source_offset as usize),
-                output.add(task.destination_offset as usize),
-                task.copy_length as usize,
-            );
+        let waited = cache_publish_and_release(&mut pipeline.decoded_lease, decode_rc);
+        if waited {
+            // Requeue game reads parked on this chunk now, not after the whole run.
+            // One requeued job needs one worker (`single_wake_locked`).
+            let g = PACK_M.lock();
+            let queued = unsafe { super::worker::requeue_cache_waiters_locked(state) };
+            if queued != 0 {
+                let single = unsafe { super::worker::single_wake_locked(state, queued) };
+                drop(g);
+                super::worker::wake_queue_workers(single);
+            }
         }
-        cache_release(&mut pipeline.decoded_lease);
     } else if decode_rc == 0 && decoded == worker.decoded_scratch {
         timed_copy(
             decoded.add(task.source_offset as usize),
@@ -599,5 +830,236 @@ unsafe fn decode_task_chunk(
             task.copy_length as usize,
         );
     }
-    decode_rc
+    (decode_rc, copied)
+}
+
+// ---- tests --------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const RW: c_int = SCE_KERNEL_PROT_CPU_READ | SCE_KERNEL_PROT_CPU_RW;
+    const PAGE: usize = 0x4000;
+
+    /// A fake address space of `(start, end_exclusive, prot)` mappings,
+    /// answering like sceKernelQueryMemoryProtection with an exclusive end.
+    fn space(
+        maps: &[(usize, usize, c_int)],
+    ) -> impl FnMut(usize) -> Option<sys::MemoryMapping> + '_ {
+        move |addr| {
+            Some(
+                maps.iter()
+                    .find(|&&(s, e, _)| s <= addr && addr < e)
+                    .map(|&(s, e, prot)| sys::MemoryMapping {
+                        rc: 0,
+                        start: s,
+                        end: e,
+                        prot,
+                    })
+                    .unwrap_or(sys::MemoryMapping {
+                        rc: SCE_KERNEL_ERROR_EINVAL,
+                        start: 0,
+                        end: 0,
+                        prot: 0,
+                    }),
+            )
+        }
+    }
+
+    /// The same space with every query refused (EACCES), as one console
+    /// answered for a title's software address targets.
+    fn refusing(_: usize) -> Option<sys::MemoryMapping> {
+        Some(sys::MemoryMapping {
+            rc: SCE_KERNEL_ERROR_EACCES,
+            start: 0,
+            end: 0,
+            prot: 0,
+        })
+    }
+
+    /// A probe writing `[at, at + 16)` into `maps`: true when every byte is
+    /// in a CPU-writable mapping. Records each probe.
+    fn prober<'a>(
+        maps: &'a [(usize, usize, c_int)],
+        probes: &'a mut alloc::vec::Vec<usize>,
+    ) -> impl FnMut(usize) -> bool + 'a {
+        move |at| {
+            probes.push(at);
+            (at..at + DESTINATION_PROBE_BYTES).all(|b| {
+                maps.iter()
+                    .any(|&(s, e, p)| s <= b && b < e && p & SCE_KERNEL_PROT_CPU_RW != 0)
+            })
+        }
+    }
+
+    fn covered(dst: usize, len: usize, maps: &[(usize, usize, c_int)]) -> bool {
+        let mut refused = 0;
+        destination_covered(
+            dst,
+            len,
+            false,
+            space(maps),
+            |_| unreachable!(),
+            &mut refused,
+        )
+    }
+
+    /// The crash shape from a core dump: a 256 KiB read into a buffer whose middle
+    /// 192 KiB was not mapped yet, the pages on both sides mapped.
+    #[test]
+    fn a_hole_in_the_destination_is_missing() {
+        let base = 0x809_6b90_0000usize;
+        let maps = [
+            (base, base + 0x6_0000, RW),
+            (base + 0x9_0000, base + 0xb_0000, RW),
+        ];
+        let dst = base + 0x5_8000;
+        assert!(!covered(dst, 0x4_0000, &maps));
+        // The first 32 KiB alone, and the read once the hole is mapped.
+        assert!(covered(dst, 0x8000, &maps));
+        assert!(covered(dst, 0x4_0000, &[(base, base + 0xb_0000, RW)]));
+    }
+
+    /// The same hole with every query refused and with a blind query: the
+    /// probes find it, one per page. A blind query skips the queries.
+    #[test]
+    fn a_refused_query_probes_each_page() {
+        let base = 0x809_6b90_0000usize;
+        let maps = [
+            (base, base + 0x6_0000, RW),
+            (base + 0x9_0000, base + 0xb_0000, RW),
+        ];
+        let dst = base + 0x5_8000;
+        let (mut probes, mut refused) = (alloc::vec::Vec::new(), 0);
+        let probe = prober(&maps, &mut probes);
+        let ok = destination_covered(dst, 0x4_0000, false, refusing, probe, &mut refused);
+        assert!(!ok);
+        // 0x...58000 and 0x...5c000 pass, 0x...60000 is the hole.
+        assert_eq!(probes, [dst, dst + PAGE, dst + 2 * PAGE]);
+        // One refused answer turns the walk into probing, no query a page.
+        assert_eq!(refused, 1);
+
+        let (mut probes, mut refused) = (alloc::vec::Vec::new(), 0);
+        let probe = prober(&maps, &mut probes);
+        let ok = destination_covered(
+            dst,
+            0x4_0000,
+            true,
+            |_: usize| unreachable!(),
+            probe,
+            &mut refused,
+        );
+        assert!(!ok);
+        assert_eq!(probes, [dst, dst + PAGE, dst + 2 * PAGE]);
+        assert_eq!(refused, 0);
+
+        let filled = [(base, base + 0xb_0000, RW)];
+        let (mut probes, mut refused) = (alloc::vec::Vec::new(), 0);
+        let probe = prober(&filled, &mut probes);
+        let ok = destination_covered(dst, 0x4_0000, false, refusing, probe, &mut refused);
+        assert!(ok);
+        assert_eq!(probes.len(), 0x4_0000 / PAGE);
+        assert!(probes
+            .iter()
+            .all(|&at| dst <= at && at + 16 <= dst + 0x4_0000));
+    }
+
+    /// A probe never writes outside the destination: an unaligned tail is
+    /// probed at its last 16 bytes, and a destination under 16 bytes is not
+    /// probed at all (unchecked, as before the check existed).
+    #[test]
+    fn probes_stay_inside_the_destination() {
+        let dst = 0x50_3ff8;
+        // Across a page boundary: one probe checks both pages.
+        assert_eq!(
+            destination_probe_at(dst, dst + 0x20, dst),
+            Some((dst, dst + 0x20))
+        );
+        assert_eq!(
+            destination_probe_at(dst, dst + PAGE * 2, dst),
+            Some((dst, 0x50_8000))
+        );
+        // A tail of 8 bytes on the last page: the probe starts 16 bytes
+        // before the end, covering both pages.
+        let last = 0x50_8008;
+        assert_eq!(
+            destination_probe_at(dst, last, 0x50_8000),
+            Some((last - 16, last))
+        );
+        assert_eq!(destination_probe_at(dst, dst + 15, dst), None);
+        let (mut probes, mut refused) = (alloc::vec::Vec::new(), 0);
+        let none: [(usize, usize, c_int); 0] = [];
+        assert!(destination_covered(
+            dst,
+            15,
+            false,
+            refusing,
+            prober(&none, &mut probes),
+            &mut refused
+        ));
+        assert!(probes.is_empty());
+    }
+
+    /// A read across adjacent mappings is covered when every one is
+    /// CPU-writable, and not when one of them is read-only.
+    #[test]
+    fn adjacent_mappings_need_cpu_write_each() {
+        let maps = [(0x10_0000, 0x11_0000, RW), (0x11_0000, 0x12_0000, RW)];
+        assert!(covered(0x10_8000, 0x1_0000, &maps));
+        let ro = [
+            (0x10_0000, 0x11_0000, RW),
+            (0x11_0000, 0x12_0000, SCE_KERNEL_PROT_CPU_READ),
+        ];
+        assert!(!covered(0x10_8000, 0x1_0000, &ro));
+    }
+
+    fn answer(rc: c_int, start: usize, end: usize, prot: c_int) -> Option<sys::MemoryMapping> {
+        Some(sys::MemoryMapping {
+            rc,
+            start,
+            end,
+            prot,
+        })
+    }
+
+    #[test]
+    fn destination_step_reads_both_end_forms() {
+        let a = 0x20_1000;
+        // Exclusive end: the walk continues at the end.
+        let mapped = DestinationStep::MappedTo(0x20_4000);
+        assert_eq!(
+            destination_step(answer(0, 0x20_0000, 0x20_4000, RW), a),
+            mapped
+        );
+        // Inclusive end (last byte): the same mapping.
+        assert_eq!(
+            destination_step(answer(0, 0x20_0000, 0x20_3fff, RW), a),
+            mapped
+        );
+        // An answer not containing addr, a failure, no CPU write.
+        let missing = DestinationStep::Missing;
+        assert_eq!(
+            destination_step(answer(0, a + PAGE, a + 2 * PAGE, RW), a),
+            missing
+        );
+        assert_eq!(
+            destination_step(answer(SCE_KERNEL_ERROR_EINVAL, 0, 0, 0), a),
+            missing
+        );
+        let read_only = SCE_KERNEL_PROT_CPU_READ;
+        assert_eq!(
+            destination_step(answer(0, 0x20_0000, 0x20_4000, read_only), a),
+            missing
+        );
+        let refused = destination_step(answer(SCE_KERNEL_ERROR_EACCES, 0, 0, 0), a);
+        assert_eq!(refused, DestinationStep::Refused);
+    }
+
+    #[test]
+    fn empty_and_overflowing_destinations() {
+        let none: [(usize, usize, c_int); 0] = [];
+        assert!(covered(0x30_0000, 0, &none));
+        assert!(!covered(usize::MAX - 8, 0x100, &none));
+    }
 }

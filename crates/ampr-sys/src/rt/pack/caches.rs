@@ -18,6 +18,9 @@ pub(crate) unsafe fn cache_find_page_run_locked(state: *mut PackState, count: u3
 
 pub(crate) unsafe fn cache_release_entry_locked(state: *mut PackState, index: u32) {
     cache_hash_unlink_locked(state, index);
+    if (*state).cache_entries[index as usize].protected {
+        cache_unprotect_locked(state, index);
+    }
     let (start, count) = {
         let e = &(*state).cache_entries[index as usize];
         (e.page_start, e.page_count)
@@ -32,15 +35,79 @@ pub(crate) unsafe fn cache_release_entry_locked(state: *mut PackState, index: u3
     (*state).cache_free_head = index;
 }
 
+// ---- protected segment ----
+//
+// One reference bit cannot tell a chunk hit 500 times from one hit twice: a
+// level load that admits more than the cache holds turns the hand twice and
+// evicts everything, menus and UI included. An entry hit
+// `tune::cache_protect_hits` times while cached turns protected, and the
+// hand skips protected entries while they hold at most
+// `tune::cache_protect_pct` of the cache. Same memory, same CACHE_MUTEX.
+
+/// Bytes an entry holds: its whole pages.
+fn cache_entry_bytes(entry: &CacheEntry) -> usize {
+    entry.page_count as usize * PACK_CACHE_PAGE_BYTES
+}
+
+/// Most bytes protected entries keep before the hand demotes them. None
+/// with `cache_protect_hits` 0, so entries protected before a live change
+/// to 0 are demoted as the hand meets them and the cache turns plain clock.
+unsafe fn cache_protected_share(state: *mut PackState) -> usize {
+    if super::super::tune::cache_protect_hits() == 0 {
+        return 0;
+    }
+    (*state).cache_page_count as usize * PACK_CACHE_PAGE_BYTES
+        * super::super::tune::cache_protect_pct() as usize
+        / 100
+}
+
+/// Counts a hit on a Ready entry; the `cache_protect_hits`-th one makes it
+/// protected (0 protects nothing).
+pub(crate) unsafe fn cache_note_hit_locked(state: *mut PackState, index: u32) {
+    let limit = super::super::tune::cache_protect_hits();
+    let entry = &mut (*state).cache_entries[index as usize];
+    entry.referenced = true;
+    entry.hits = entry.hits.saturating_add(1);
+    if limit == 0 || entry.protected || (entry.hits as u32) < limit {
+        return;
+    }
+    entry.protected = true;
+    let bytes = cache_entry_bytes(entry);
+    (*state).cache_protected_bytes += bytes;
+    stats::add(stats::Stat::CachePromotions, 1);
+    stats::add(stats::Stat::CacheProtectedBytes, bytes as u64);
+}
+
+/// Takes `index` out of the protected segment (demotion or release).
+unsafe fn cache_unprotect_locked(state: *mut PackState, index: u32) {
+    let entry = &mut (*state).cache_entries[index as usize];
+    entry.protected = false;
+    entry.hits = 0;
+    let bytes = cache_entry_bytes(entry);
+    (*state).cache_protected_bytes = (*state).cache_protected_bytes.saturating_sub(bytes);
+    stats::sub(stats::Stat::CacheProtectedBytes, bytes as u64);
+}
+
 /// The hand walks only the indices below the high-water mark (at most the
-/// live entry count, about 256 for 256 KiB zstd chunks in the 64 MiB cache)
-/// instead of all 8192 slots, and wraps at it, so it visits the live entries
+/// live entry count, about 540 for 256 KiB zstd chunks in the 135 MiB cache)
+/// instead of all 16384 slots, and wraps at it, so it visits the live entries
 /// in the same order as a full-range hand would.
+///
+/// Protected entries are skipped while the protected bytes are within
+/// their share; above it the hand treats them as a clock does, but the
+/// first unreferenced one it meets is demoted to probation with its bit
+/// set, so it gets one more sweep. Three turns cover a demoted entry's bit
+/// clear and eviction. A turn that meets only protected entries within
+/// their share evicts the first one it skipped, so a load never fails for
+/// lack of room while an entry could go.
 pub(crate) unsafe fn cache_evict_one_locked(state: *mut PackState) -> bool {
     let limit = (*state)
         .cache_entry_high_water
         .min(AMPR_EMU_PACK_CACHE_ENTRY_CAP as u32);
-    for _ in 0..limit * 2 {
+    let share = cache_protected_share(state);
+    let mut fallback = INVALID_INDEX;
+    let mut since_probation = 0u32;
+    for _ in 0..limit * 3 {
         let index = if (*state).cache_clock < limit {
             (*state).cache_clock
         } else {
@@ -54,11 +121,32 @@ pub(crate) unsafe fn cache_evict_one_locked(state: *mut PackState) -> bool {
         {
             continue;
         }
+        if entry.protected && (*state).cache_protected_bytes <= share {
+            if fallback == INVALID_INDEX {
+                fallback = index;
+            }
+            since_probation += 1;
+            if since_probation >= limit {
+                break;
+            }
+            continue;
+        }
+        since_probation = 0;
         if entry.referenced {
             entry.referenced = false;
             continue;
         }
+        if entry.protected {
+            cache_unprotect_locked(state, index);
+            (*state).cache_entries[index as usize].referenced = true;
+            stats::add(stats::Stat::CacheDemotions, 1);
+            continue;
+        }
         cache_release_entry_locked(state, index);
+        return true;
+    }
+    if fallback != INVALID_INDEX {
+        cache_release_entry_locked(state, fallback);
         return true;
     }
     false
@@ -91,24 +179,24 @@ pub(crate) unsafe fn cache_take_failed_locked(
     0
 }
 
-/// `partial`: the read copies only part of the chunk. A partial read is
-/// admitted on its first touch: the rest of the chunk is usually read next
-/// (a stream reading 16-64 KiB of a 256 KiB chunk), and without admission
-/// every such read decoded the whole chunk again (pkg: the full Kraken
-/// block, read and decoded twice before the second-touch rule kept it).
+/// A read of part of a chunk is admitted on its first touch: small
+/// sequential reads over one chunk would otherwise read the disk and decode
+/// it once per read until the second touch. A full-chunk read (`full_chunk`)
+/// decodes straight into the game buffer, so it is admitted on its second
+/// touch, as before.
 pub(crate) unsafe fn cache_should_admit_locked(
     state: *mut PackState,
     chunk: &AmprPackChunkView,
     file_flags: u32,
     key_hash: u64,
-    partial: bool,
+    full_chunk: bool,
 ) -> bool {
     if file_flags & AMPR_PACK_FILE_STREAMING != 0 || chunk.flags & AMPR_PACK_CHUNK_STREAMING != 0 {
         return false;
     }
-    if partial
-        || file_flags & AMPR_PACK_FILE_HOT != 0
+    if file_flags & AMPR_PACK_FILE_HOT != 0
         || chunk.flags & AMPR_PACK_CHUNK_SHARED != 0
+        || !full_chunk
     {
         return true;
     }
@@ -125,19 +213,16 @@ pub(crate) unsafe fn cache_should_admit_locked(
     touch.count >= 2
 }
 
-/// `wait_for_loader = false` returns Pending on a Loading entry instead of
-/// blocking. `force_admit` (read-ahead, readahead.rs) skips
-/// the admission policy, so a missing chunk always gets a Load lease if room.
-/// `waiter`: the caller got Pending for this chunk last time and was woken by
-/// a publication, so a Failed entry is its loader's answer (see
-/// cache_take_failed_locked). `partial`: see cache_should_admit_locked.
+/// A Loading entry returns Pending, never a wait: the caller parks its job
+/// and the publication epoch wakes it. `waiter`: the caller got Pending for
+/// this chunk last time and was woken by a publication, so a Failed entry is
+/// its loader's answer (see cache_take_failed_locked). `full_chunk`: the read copies the whole chunk
+/// (see cache_should_admit_locked).
 pub(crate) unsafe fn cache_acquire(
     chunk: &AmprPackChunkView,
     file_flags: u32,
-    wait_for_loader: bool,
-    force_admit: bool,
-    mut waiter: bool,
-    partial: bool,
+    full_chunk: bool,
+    waiter: bool,
 ) -> CacheAcquireResult {
     let state = unsafe { pack_state() };
     let mut result = CacheAcquireResult::EMPTY;
@@ -145,99 +230,100 @@ pub(crate) unsafe fn cache_acquire(
         return result;
     }
     let key_hash = chunk_key_hash(chunk);
-    let mut lock = CACHE_MUTEX.lock();
-    loop {
-        let found = cache_find_locked(state, chunk, key_hash);
-        if found != INVALID_INDEX {
-            let entry = &mut (*state).cache_entries[found as usize];
-            match entry.state {
-                CacheEntryState::Loading => {
-                    if !wait_for_loader {
-                        // While Loading, error marks a waiter; publication replaces it.
-                        entry.error = 1;
-                        result.kind = CacheAcquireKind::Pending;
-                        return result;
-                    }
-                    CACHE_CVS[cache_wait_bucket(key_hash) as usize].wait(&mut lock);
-                    waiter = true;
-                    continue;
-                }
-                CacheEntryState::Ready => {
-                    entry.pin_count += 1;
-                    entry.referenced = true;
-                    result.kind = CacheAcquireKind::Ready;
-                    result.lease.entry = found;
-                    result.lease.data = unsafe {
-                        (*state)
-                            .cache_base
-                            .add(entry.page_start as usize * PACK_CACHE_PAGE_BYTES)
-                    };
+    let _lock = CACHE_MUTEX.lock();
+    let found = cache_find_locked(state, chunk, key_hash);
+    if found != INVALID_INDEX {
+        let entry = &mut (*state).cache_entries[found as usize];
+        match entry.state {
+            CacheEntryState::Loading => {
+                // While Loading, error marks a waiter; publication replaces it.
+                entry.error = 1;
+                result.kind = CacheAcquireKind::Pending;
+                return result;
+            }
+            CacheEntryState::Ready => {
+                entry.pin_count += 1;
+                let page_start = entry.page_start;
+                cache_note_hit_locked(state, found);
+                result.kind = CacheAcquireKind::Ready;
+                result.lease.entry = found;
+                result.lease.data = unsafe {
+                    (*state)
+                        .cache_base
+                        .add(page_start as usize * PACK_CACHE_PAGE_BYTES)
+                };
+                return result;
+            }
+            CacheEntryState::Failed => {
+                let error = cache_take_failed_locked(state, found, waiter);
+                if error != 0 {
+                    result.kind = CacheAcquireKind::Failed;
+                    result.lease.error = error;
                     return result;
                 }
-                CacheEntryState::Failed => {
-                    let error = cache_take_failed_locked(state, found, waiter);
-                    if error != 0 {
-                        result.kind = CacheAcquireKind::Failed;
-                        result.lease.error = error;
-                        return result;
-                    }
-                }
-                CacheEntryState::Free => {}
             }
+            CacheEntryState::Free => {}
         }
+    }
 
-        if !force_admit && !cache_should_admit_locked(state, chunk, file_flags, key_hash, partial) {
-            return result;
-        }
-        let page_count =
-            ((chunk.raw_size as usize + PACK_CACHE_PAGE_BYTES - 1) / PACK_CACHE_PAGE_BYTES) as u32;
-        let mut page_start = cache_find_page_run_locked(state, page_count);
-        while (page_start == INVALID_INDEX || (*state).cache_free_head == INVALID_INDEX)
-            && cache_evict_one_locked(state)
-        {
-            page_start = cache_find_page_run_locked(state, page_count);
-        }
-        if page_start == INVALID_INDEX || (*state).cache_free_head == INVALID_INDEX {
-            return result;
-        }
-        let index = (*state).cache_free_head;
-        if index >= (*state).cache_entry_high_water {
-            (*state).cache_entry_high_water = index + 1;
-        }
-        let entry = &mut (*state).cache_entries[index as usize];
-        (*state).cache_free_head = entry.free_next;
-        *entry = CacheEntry {
-            key_hash,
-            physical_offset: chunk.offset,
-            stored_size: chunk.stored_size,
-            raw_size: chunk.raw_size,
-            page_start,
-            page_count,
-            pin_count: 1,
-            pack_id: chunk.pack_id,
-            state: CacheEntryState::Loading,
-            referenced: true,
-            free_next: INVALID_INDEX,
-            ..CacheEntry::EMPTY
-        };
-        cache_mark_pages(state, page_start, page_count, true);
-        let page_end = page_start + page_count;
-        (*state).cache_page_cursor = if page_end == (*state).cache_page_count {
-            0
-        } else {
-            page_end
-        };
-        cache_hash_link_locked(state, index);
-        result.kind = CacheAcquireKind::Load;
-        result.lease.entry = index;
-        result.lease.data = unsafe {
-            (*state)
-                .cache_base
-                .add(page_start as usize * PACK_CACHE_PAGE_BYTES)
-        };
-        result.lease.loader = true;
+    if !cache_should_admit_locked(state, chunk, file_flags, key_hash, full_chunk) {
         return result;
     }
+    let page_count =
+        ((chunk.raw_size as usize + PACK_CACHE_PAGE_BYTES - 1) / PACK_CACHE_PAGE_BYTES) as u32;
+    let mut page_start = cache_find_page_run_locked(state, page_count);
+    while page_start == INVALID_INDEX || (*state).cache_free_head == INVALID_INDEX {
+        // Pages are free but every entry is taken: the entry cap, not
+        // the cache size, makes this eviction (debug `cache_cap_evictions`).
+        let cap_only = page_start != INVALID_INDEX;
+        if !cache_evict_one_locked(state) {
+            break;
+        }
+        if cap_only {
+            stats::add(stats::Stat::CacheCapEvictions, 1);
+        }
+        page_start = cache_find_page_run_locked(state, page_count);
+    }
+    if page_start == INVALID_INDEX || (*state).cache_free_head == INVALID_INDEX {
+        return result;
+    }
+    let index = (*state).cache_free_head;
+    if index >= (*state).cache_entry_high_water {
+        (*state).cache_entry_high_water = index + 1;
+    }
+    let entry = &mut (*state).cache_entries[index as usize];
+    (*state).cache_free_head = entry.free_next;
+    *entry = CacheEntry {
+        key_hash,
+        physical_offset: chunk.offset,
+        stored_size: chunk.stored_size,
+        raw_size: chunk.raw_size,
+        page_start,
+        page_count,
+        pin_count: 1,
+        pack_id: chunk.pack_id,
+        state: CacheEntryState::Loading,
+        referenced: true,
+        free_next: INVALID_INDEX,
+        ..CacheEntry::EMPTY
+    };
+    cache_mark_pages(state, page_start, page_count, true);
+    let page_end = page_start + page_count;
+    (*state).cache_page_cursor = if page_end == (*state).cache_page_count {
+        0
+    } else {
+        page_end
+    };
+    cache_hash_link_locked(state, index);
+    result.kind = CacheAcquireKind::Load;
+    result.lease.entry = index;
+    result.lease.data = unsafe {
+        (*state)
+            .cache_base
+            .add(page_start as usize * PACK_CACHE_PAGE_BYTES)
+    };
+    result.lease.loader = true;
+    result
 }
 
 /// True when the decoded cache holds `chunk` (Ready or Loading), without
@@ -269,48 +355,45 @@ pub(crate) fn cache_error_is_transient(error: c_int) -> bool {
         || error == SCE_KERNEL_ERROR_ECANCELED
 }
 
-pub(crate) unsafe fn cache_publish(lease: &mut CacheLease, error: c_int) -> bool {
-    if lease.entry == INVALID_INDEX {
-        return false;
+/// Publishes the loader's answer for `lease` (Ready, Failed, or a dropped
+/// transient failure). Returns the wait bucket to bump and whether a reader
+/// waited, or None when the lease is not a live loading entry. CACHE_MUTEX
+/// held.
+unsafe fn cache_publish_locked(
+    state: *mut PackState,
+    lease: &mut CacheLease,
+    error: c_int,
+) -> Option<(usize, bool)> {
+    if lease.entry as usize >= AMPR_EMU_PACK_CACHE_ENTRY_CAP {
+        return None;
     }
-    let state = unsafe { pack_state() };
-    let wait_bucket;
-    let waited;
-    {
-        let _lock = CACHE_MUTEX.lock();
-        if lease.entry as usize >= AMPR_EMU_PACK_CACHE_ENTRY_CAP {
-            return false;
-        }
-        let entry = &mut (*state).cache_entries[lease.entry as usize];
-        if entry.state != CacheEntryState::Loading || entry.pin_count == 0 {
-            return false;
-        }
-        wait_bucket = cache_wait_bucket(entry.key_hash) as usize;
-        waited = entry.error != 0;
-        if error == 0 {
-            entry.state = CacheEntryState::Ready;
-            entry.error = 0;
-        } else if cache_error_is_transient(error) && entry.pin_count == 1 {
-            // Pending readers do not pin loading entries; drop a transient
-            // loader failure before waking them so none sees Failed.
-            cache_release_entry_locked(state, lease.entry);
-            *lease = CacheLease::EMPTY;
-        } else {
-            entry.state = CacheEntryState::Failed;
-            entry.error = error;
-        }
+    let entry = &mut (*state).cache_entries[lease.entry as usize];
+    if entry.state != CacheEntryState::Loading || entry.pin_count == 0 {
+        return None;
     }
-    DECODED_CACHE_PUBLICATION_EPOCH[wait_bucket].fetch_add(1, Ordering::Release);
-    CACHE_CVS[wait_bucket].notify_all();
-    waited
+    let wait_bucket = cache_wait_bucket(entry.key_hash) as usize;
+    let waited = entry.error != 0;
+    if error == 0 {
+        entry.state = CacheEntryState::Ready;
+        entry.error = 0;
+    } else if cache_error_is_transient(error) && entry.pin_count == 1 {
+        // Pending readers do not pin loading entries; drop a transient
+        // loader failure before waking them so none sees Failed.
+        cache_release_entry_locked(state, lease.entry);
+        *lease = CacheLease::EMPTY;
+    } else {
+        entry.state = CacheEntryState::Failed;
+        entry.error = error;
+    }
+    Some((wait_bucket, waited))
 }
 
-pub(crate) unsafe fn cache_release(lease: &mut CacheLease) {
+/// Drops `lease`'s pin; the last pin of a transient failure frees the
+/// entry. CACHE_MUTEX held.
+unsafe fn cache_release_locked(state: *mut PackState, lease: &mut CacheLease) {
     if lease.entry == INVALID_INDEX {
         return;
     }
-    let state = unsafe { pack_state() };
-    let _lock = CACHE_MUTEX.lock();
     if (lease.entry as usize) < AMPR_EMU_PACK_CACHE_ENTRY_CAP {
         let entry = &mut (*state).cache_entries[lease.entry as usize];
         if entry.pin_count != 0 {
@@ -326,7 +409,42 @@ pub(crate) unsafe fn cache_release(lease: &mut CacheLease) {
     *lease = CacheLease::EMPTY;
 }
 
-// ampr_format::cache::WAIT_BUCKETS sizes the epoch and condvar arrays.
+/// Wakes the readers parked on a publication (outside CACHE_MUTEX).
+fn cache_bump_publication(published: Option<(usize, bool)>) -> bool {
+    let Some((wait_bucket, waited)) = published else {
+        return false;
+    };
+    DECODED_CACHE_PUBLICATION_EPOCH[wait_bucket].fetch_add(1, Ordering::Release);
+    waited
+}
+
+pub(crate) unsafe fn cache_release(lease: &mut CacheLease) {
+    if lease.entry == INVALID_INDEX {
+        return;
+    }
+    let state = unsafe { pack_state() };
+    let _lock = CACHE_MUTEX.lock();
+    unsafe { cache_release_locked(state, lease) };
+}
+
+/// The loader's publish and its release under one CACHE_MUTEX section, once
+/// it is done with the entry's bytes: a miss took the mutex three times
+/// (acquire, publish, release), now twice. Returns whether a reader waited.
+pub(crate) unsafe fn cache_publish_and_release(lease: &mut CacheLease, error: c_int) -> bool {
+    if lease.entry == INVALID_INDEX {
+        return false;
+    }
+    let state = unsafe { pack_state() };
+    let published = {
+        let _lock = CACHE_MUTEX.lock();
+        let published = unsafe { cache_publish_locked(state, lease, error) };
+        unsafe { cache_release_locked(state, lease) };
+        published
+    };
+    cache_bump_publication(published)
+}
+
+// ampr_format::cache::WAIT_BUCKETS sizes the epoch array.
 const _: () = assert!(PACK_CACHE_WAIT_BUCKET_COUNT == 64);
 pub(crate) fn cache_wait_bucket(key_hash: u64) -> u32 {
     ampr_rust_cache_wait_bucket(key_hash)
@@ -409,9 +527,128 @@ mod decoded_cache_tests {
                 assert!((*state).cache_clock <= 4);
             }
             // Entry 1 loses its reference bit on the first pass and goes last,
-            // as with a hand over all 8192 slots.
+            // as with a hand over all 16384 slots.
             assert_eq!(order, [0, 2, 3, 1]);
             assert!(!cache_evict_one_locked(state));
+        }
+    }
+
+    /// The release hit count (the debug knob defaults to it; no test
+    /// changes the cache knobs).
+    const CACHE_PROTECT_HITS_TEST: u32 = super::super::super::tune::CACHE_PROTECT_HITS_DEFAULT;
+
+    /// A partial-chunk read is admitted on its first touch; a full-chunk
+    /// read on its second; a streaming chunk never.
+    #[test]
+    fn partial_reads_admit_on_first_touch() {
+        let state = cache_state(0);
+        let chunk = AmprPackChunkView::default();
+        unsafe {
+            assert!(cache_should_admit_locked(state, &chunk, 0, 0x77, false));
+            assert!(!cache_should_admit_locked(state, &chunk, 0, 0x78, true));
+            assert!(cache_should_admit_locked(state, &chunk, 0, 0x78, true));
+            let streaming = AmprPackChunkView {
+                flags: AMPR_PACK_CHUNK_STREAMING as u8,
+                ..chunk
+            };
+            assert!(!cache_should_admit_locked(state, &streaming, 0, 0x79, false));
+        }
+    }
+
+    /// Admits a Ready one-page entry for `key_hash` as cache_acquire's
+    /// miss path does: evict until a page and an entry are free.
+    fn insert_ready(state: *mut PackState, key_hash: u64) -> u32 {
+        unsafe {
+            let mut page = cache_find_page_run_locked(state, 1);
+            while (page == INVALID_INDEX || (*state).cache_free_head == INVALID_INDEX)
+                && cache_evict_one_locked(state)
+            {
+                page = cache_find_page_run_locked(state, 1);
+            }
+            assert!(page != INVALID_INDEX && (*state).cache_free_head != INVALID_INDEX);
+            let index = (*state).cache_free_head;
+            let entry = &mut (*state).cache_entries[index as usize];
+            (*state).cache_free_head = entry.free_next;
+            *entry = CacheEntry::EMPTY;
+            entry.key_hash = key_hash;
+            entry.page_start = page;
+            entry.page_count = 1;
+            entry.state = CacheEntryState::Ready;
+            entry.referenced = true;
+            cache_mark_pages(state, page, 1, true);
+            cache_hash_link_locked(state, index);
+            index
+        }
+    }
+
+    /// A level load that streams 16 cache sizes of new chunks through the
+    /// cache while the game re-reads 8 hot chunks now and then: the hot
+    /// chunks turn protected and stay cached; with the plain clock the
+    /// stream evicts them between re-reads.
+    #[test]
+    fn hot_set_survives_a_scan_past_the_cache_size() {
+        let state = cache_state(64);
+        let hot: Vec<(u64, u32)> = (0..8u32).map(|i| (0x1000 + i as u64, i)).collect();
+        unsafe {
+            for &(_, index) in &hot {
+                for _ in 0..CACHE_PROTECT_HITS_TEST {
+                    cache_note_hit_locked(state, index);
+                }
+                assert!((*state).cache_entries[index as usize].protected);
+            }
+            assert_eq!((*state).cache_protected_bytes, 8 * PACK_CACHE_PAGE_BYTES);
+            for n in 0..64 * 16u64 {
+                insert_ready(state, 0x10_0000 + n);
+                if n % 128 == 0 {
+                    for &(key, index) in &hot {
+                        assert!(linked(state, key, index), "hot chunk {key:#x} evicted");
+                        cache_note_hit_locked(state, index);
+                    }
+                }
+            }
+            for &(key, index) in &hot {
+                assert!(linked(state, key, index), "hot chunk {key:#x} evicted");
+            }
+            // The cold first fill is gone.
+            assert!(!linked(state, 0x1000 + 63, 63));
+        }
+    }
+
+    /// Above the share the hand demotes protected entries to probation (bit
+    /// set, hits cleared) and then evicts them like any other entry.
+    #[test]
+    fn protected_entries_above_the_share_are_demoted() {
+        let state = cache_state(64);
+        unsafe {
+            for index in 0..40 {
+                for _ in 0..CACHE_PROTECT_HITS_TEST {
+                    cache_note_hit_locked(state, index);
+                }
+            }
+            // 40 of 64 pages protected, above the 50% share.
+            assert_eq!((*state).cache_protected_bytes, 40 * PACK_CACHE_PAGE_BYTES);
+            for _ in 0..64 {
+                assert!(cache_evict_one_locked(state));
+            }
+            assert_eq!((*state).cache_protected_bytes, 0);
+            assert!(!cache_evict_one_locked(state));
+        }
+    }
+
+    /// A sweep that meets only protected entries within their share still
+    /// evicts one, so a load never fails for lack of room.
+    #[test]
+    fn only_protected_entries_still_evict_one() {
+        let state = cache_state(16);
+        unsafe {
+            (*state).cache_page_count = 64;
+            for index in 0..16 {
+                for _ in 0..CACHE_PROTECT_HITS_TEST {
+                    cache_note_hit_locked(state, index);
+                }
+            }
+            assert!(cache_evict_one_locked(state));
+            assert_eq!((*state).cache_protected_bytes, 15 * PACK_CACHE_PAGE_BYTES);
         }
     }
 
@@ -449,6 +686,60 @@ mod decoded_cache_tests {
             assert!(entry.state == CacheEntryState::Failed);
             assert!(cache_error_is_transient(entry.error));
             assert!(!linked(state, 0x1000, 0));
+        }
+    }
+
+    /// A loader's entry with one pin and a parked reader (`error` 1).
+    fn loading(state: *mut PackState, index: u32) -> CacheLease {
+        let entry = unsafe { &mut (*state).cache_entries[index as usize] };
+        entry.state = CacheEntryState::Loading;
+        entry.pin_count = 1;
+        entry.error = 1;
+        CacheLease {
+            entry: index,
+            loader: true,
+            ..CacheLease::EMPTY
+        }
+    }
+
+    /// The merged publish and release leave what the two calls left: a
+    /// Ready entry with no pin, a Failed one with no pin, or a transient
+    /// failure dropped, each reporting the parked reader once.
+    #[test]
+    fn publish_then_release_in_one_section() {
+        let state = cache_state(3);
+        unsafe {
+            let mut lease = loading(state, 0);
+            assert_eq!(
+                cache_publish_locked(state, &mut lease, 0).map(|(_, w)| w),
+                Some(true)
+            );
+            cache_release_locked(state, &mut lease);
+            let entry = &(*state).cache_entries[0];
+            assert!(entry.state == CacheEntryState::Ready && entry.pin_count == 0);
+            assert_eq!(lease.entry, INVALID_INDEX);
+            assert!(linked(state, 0x1000, 0));
+
+            let mut lease = loading(state, 1);
+            assert!(cache_publish_locked(state, &mut lease, SCE_KERNEL_ERROR_EIO).is_some());
+            cache_release_locked(state, &mut lease);
+            let entry = &(*state).cache_entries[1];
+            assert!(entry.state == CacheEntryState::Failed && entry.pin_count == 0);
+            assert!(linked(state, 0x1001, 1));
+
+            let mut lease = loading(state, 2);
+            assert!(cache_publish_locked(state, &mut lease, SCE_KERNEL_ERROR_EAGAIN).is_some());
+            assert_eq!(lease.entry, INVALID_INDEX);
+            cache_release_locked(state, &mut lease);
+            assert!((*state).cache_entries[2].state == CacheEntryState::Free);
+            assert!(!linked(state, 0x1002, 2));
+
+            // A second publish of a lease no longer loading reports nothing.
+            let mut stale = CacheLease {
+                entry: 0,
+                ..CacheLease::EMPTY
+            };
+            assert!(cache_publish_locked(state, &mut stale, 0).is_none());
         }
     }
 }

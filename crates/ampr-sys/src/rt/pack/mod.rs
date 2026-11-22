@@ -6,10 +6,10 @@
 //! - Functions keep their upstream names (snake_case or camelCase as they
 //!   are). Methods live in `impl` blocks that may be split across parts; a
 //!   constructor is `new`, a destructor is `impl Drop`.
-//! - Signatures keep a fixed parameter order, telemetry timestamps included
-//!   (pass 0). Out-parameters are `&mut T`, read-only ones `&T`, raw buffers
-//!   `*mut T` / `*const T`; `pack_state()` returns `*mut PackState`
-//!   (access fields as `(*state).x`; never form `&PackState`).
+//! - Signatures keep a fixed parameter order. Out-parameters are `&mut T`,
+//!   read-only ones `&T`, raw buffers `*mut T` / `*const T`; `pack_state()`
+//!   returns `*mut PackState` (access fields as `(*state).x`; never form
+//!   `&PackState`).
 //!   C scalars use `c_int`, `usize`, `c_long` and the `sys` aliases
 //!   `off_t`/`ssize_t`. Struct fields are snake_case (`io_window_pack_id`).
 //! - Build-time knobs keep their macro-style names (`AMPR_EMU_PACK_WORKERS`).
@@ -17,11 +17,11 @@
 //!   `AMPR_PACK_FILE_PACKED`, `INVALID_INDEX`).
 //! - The PackState mutexes, condvars and atomics live in separate statics
 //!   (see "sync state"), so lock guards never borrow PackState:
-//!   `PACK_M`, `CACHE_CVS[i]`, etc.
+//!   `PACK_M`, `QUEUE_CV`, etc.
 //! - Detour targets (`*_emul`) keep the C ABI; runtime helpers use Rust calls.
-//! - Telemetry timestamps are not implemented: `pack_telemetry_usecs()`
-//!   returns 0. Debug counters go through `stats::*` (no-ops unless
-//!   `mem_report`).
+//! - Upstream's telemetry timestamps were never ported and their parameters
+//!   are gone (they were always 0). Debug counters go through `stats::*`
+//!   (no-ops unless `mem_report`).
 //! - Shared helpers: `sce_errno_from_posix`, `posix_errno_from_sce`,
 //!   `errno()`, `kernel_slot::<F>`, hook ids `sys::hook::x`,
 //!   `spin_pause_or_yield(&mut spins)`, and `ampr_lz4::decode_chunk`
@@ -76,8 +76,8 @@ use super::reactor;
 pub(crate) use super::reactor::apr_reactor_notify_external_progress;
 
 // ---- libScePthread thread API (same signatures as rt/reactor/mod.rs) -------
+pub(crate) use super::reactor::scePthreadJoin;
 unsafe extern "C" {
-    pub(crate) fn scePthreadJoin(thread: ScePthread, value: *mut *mut c_void) -> c_int;
     pub(crate) fn scePthreadSelf() -> ScePthread;
     pub(crate) fn scePthreadSetprio(thread: ScePthread, prio: c_int) -> c_int;
     pub(crate) fn scePthreadSetaffinity(thread: ScePthread, mask: u64) -> c_int;
@@ -126,20 +126,12 @@ mod aio;
 pub(crate) use aio::*;
 mod aio_wait;
 pub(crate) use aio_wait::*;
-mod readahead;
-pub(crate) use readahead::*;
-/// mmap of a packed file (both formats) through a disk cache copy (hook ids
-/// 96, 97).
-pub(crate) mod mmap;
-/// `AMPR_ZSTD_MMAP=1`: decode-on-access mappings and their fault handler.
-/// zstd only; an LZ4 mapping takes the disk cache copy in `mmap`.
-pub(crate) mod mmap_fault;
 /// zstd mount state and accessors (reached as `zstd::x`).
 pub(crate) mod zstd;
-pub(crate) mod zstd_libc;
+pub(crate) mod pack_libc;
 /// A multi-chunk packed read split into parallel child jobs (aio.rs).
-mod zstd_split;
-pub(crate) use zstd_split::*;
+mod pack_split;
+pub(crate) use pack_split::*;
 /// Pkg mode: pack 0 read straight from the .pkg `/app0/kraken.image` names.
 mod pkg;
 pub(crate) use pkg::*;
@@ -362,13 +354,115 @@ pub(crate) unsafe fn select_pack_format() {
         PackFormat::Plain
     };
     PACK_FORMAT.store(format as u8, Ordering::Relaxed);
-    // A crash between a cache file's create and unlink leaves it named, and
-    // the next title may be one that never maps (no packs, or mapping off).
-    // Sweep and remove the folder in every title, so it does not keep
-    // showing in a file explorer; with no folder both are one failed open
-    // and one failed rmdir.
-    unsafe { mmap::sweep_cache_dir() };
-    unsafe { mmap::remove_cache_dir() };
+    unsafe { remove_old_cache_dir() };
+}
+
+// ---- folder left by older builds ----
+
+// Builds up to 0.4.1 kept an mmap disk cache under /data/ampr_cache (removed:
+// no measured game mapped a packed file, `mmap_virtual` 0 on three fully
+// packed games). A crash between a cache file's create and unlink left it
+// named, so the folder could stay on /data and show in a file explorer.
+// This build only removes what an older one left, in every title; with no
+// folder it costs one failed open.
+
+/// Folder of the removed mmap disk cache.
+const OLD_CACHE_DIR: &CStr = c"/data/ampr_cache";
+static RMDIR: LazySym = LazySym::new(c"rmdir");
+
+// Real libkernel entries: the pre-detour slot once hooks install, else the
+// dynamic symbol (this runs at module_start, before any hook), so no call
+// here goes through the index path hooks. The open is the `_open` original
+// (`real_open`): libkernel `open` calls `_open`, which routes through the
+// index by default (AMPR_PACK_LIBC_HOOKS=0xfff). Before any hook installs,
+// dynamic `open` reaches the undetoured `_open`.
+unsafe fn real_open_path(path: *const c_char, flags: c_int, mode: c_int) -> c_int {
+    unsafe { real_open() }.map_or_else(eio, |f| unsafe { f(path, flags, mode) })
+}
+
+unsafe fn real_unlink(path: *const c_char) -> c_int {
+    type F = unsafe extern "C" fn(*const c_char) -> c_int;
+    unsafe { slot_or_dynamic::<F>(hook::unlink, c"unlink") }
+        .map_or_else(eio, |f| unsafe { f(path) })
+}
+
+type RmdirFn = unsafe extern "C" fn(*const c_char) -> c_int;
+
+/// rmdir of `dir`, every error ignored (ENOENT: already gone; ENOTEMPTY: a
+/// named file is left) and errno kept.
+unsafe fn remove_dir_keeping_errno(dir: &CStr, rmdir: RmdirFn) {
+    let saved = errno();
+    unsafe { rmdir(dir.as_ptr()) };
+    set_errno(saved);
+}
+
+/// At module_start (`select_pack_format`): unlinks every entry of
+/// OLD_CACHE_DIR (files only: the old code made no subfolders), then
+/// removes it. A pass that unlinks while it lists may skip entries, so
+/// passes repeat until one unlinks nothing (at most 8). When the folder
+/// does not open there is nothing to remove, so no rmdir either.
+unsafe fn remove_old_cache_dir() {
+    for _ in 0..8 {
+        match unsafe { sweep_pass() } {
+            None => return,
+            Some(0) => break,
+            Some(_) => {}
+        }
+    }
+    // rmdir has no hook id: the dynamic symbol is the real call.
+    if let Some(rmdir) = unsafe { RMDIR.get::<RmdirFn>() } {
+        unsafe { remove_dir_keeping_errno(OLD_CACHE_DIR, rmdir) };
+    }
+}
+
+/// One listing of OLD_CACHE_DIR; the entries unlinked, None when the folder
+/// does not open.
+unsafe fn sweep_pass() -> Option<usize> {
+    let dir = unsafe { real_open_path(OLD_CACHE_DIR.as_ptr(), O_RDONLY | O_DIRECTORY, 0) };
+    if dir < 0 {
+        return None;
+    }
+    // getdents wants room for at least one 264-byte record; u64 aligns it.
+    let mut buf = [0u64; 512];
+    let mut removed = 0;
+    loop {
+        let base = buf.as_mut_ptr().cast::<u8>();
+        let n = unsafe { real_physical_getdents(dir, base.cast(), size_of_val(&buf) as c_int) };
+        if n <= 0 {
+            break;
+        }
+        let mut at = 0usize;
+        while at + DIRENT_NAME_OFFSET <= n as usize {
+            // Field reads, not a &Dirent: the last record may end before
+            // the 264 bytes of a full struct.
+            let rec = unsafe { base.add(at) };
+            let fileno = unsafe { rec.cast::<u32>().read_unaligned() };
+            let reclen = unsafe {
+                rec.add(offset_of!(Dirent, d_reclen))
+                    .cast::<u16>()
+                    .read_unaligned()
+            };
+            let namlen = unsafe { *rec.add(offset_of!(Dirent, d_namlen)) } as usize;
+            let reclen = reclen as usize;
+            if reclen == 0 || at + reclen > n as usize || DIRENT_NAME_OFFSET + namlen > reclen {
+                break;
+            }
+            let name = unsafe { core::slice::from_raw_parts(rec.add(DIRENT_NAME_OFFSET), namlen) };
+            if fileno != 0 && name != b"." && name != b".." {
+                let mut path = [0u8; 300];
+                let dir_bytes = OLD_CACHE_DIR.to_bytes();
+                path[..dir_bytes.len()].copy_from_slice(dir_bytes);
+                path[dir_bytes.len()] = b'/';
+                path[dir_bytes.len() + 1..][..name.len()].copy_from_slice(name);
+                if unsafe { real_unlink(path.as_ptr().cast()) } == 0 {
+                    removed += 1;
+                }
+            }
+            at += reclen;
+        }
+    }
+    unsafe { real_physical_close(dir) };
+    Some(removed)
 }
 
 // ---- SDK AIO types ------------------------------------------------------------
@@ -505,7 +599,6 @@ pub(crate) const AMPR_PACK_BLOCK_SHIFT_MAX: u8 = 20;
 pub(crate) const AMPR_PACK_FILE_PACKED: u32 = 1 << 0;
 pub(crate) const AMPR_PACK_FILE_STREAMING: u32 = 1 << 2;
 pub(crate) const AMPR_PACK_FILE_HOT: u32 = 1 << 3;
-pub(crate) const AMPR_PACK_FILE_RANDOM_ACCESS: u32 = ampr_lz4::FILE_RANDOM_ACCESS;
 
 pub(crate) const AMPR_PACK_CHUNK_RAW: u8 = 0;
 pub(crate) const AMPR_PACK_CHUNK_LZ4: u8 = 1;
@@ -638,7 +731,6 @@ pub(crate) const AMPR_EMU_PACK_INDEX_PATH: &CStr = c"/app0/ampr_assets.index";
 /// `AMPR_EMU_PACK_INDEX_PATH ".runtime"` (AMPRPAK4 only; zstd keeps the defaults).
 pub(crate) const AMPR_EMU_PACK_RUNTIME_PROFILE_PATH: &CStr = c"/app0/ampr_assets.index.runtime";
 pub(crate) const AMPR_EMU_PACK_ROOT_PATH: &CStr = c"/app0";
-pub(crate) const AMPR_EMU_PACK_LOGICAL_ROOT_PATH: &CStr = c"/app0";
 
 /// Directories open at once through the index (a directory missing on disk,
 /// or opened with O_DIRECTORY). The numbers are plain, `DIRECTORY_BASE + slot`
@@ -659,47 +751,6 @@ const _: () = assert!(
     AMPR_EMU_PACK_WORKERS >= 1 && AMPR_EMU_PACK_WORKERS as usize <= AMPR_EMU_PACK_WORKER_CAPACITY
 );
 pub(crate) const AMPR_EMU_PACK_WORKER_CAPACITY: usize = 16;
-/// Sequential read-ahead window in chunks, from the Makefile's
-/// `AMPR_PACK_READAHEAD_CHUNKS` (Makefile default 4, HOT files only; 32, a ~1-1.5 MiB
-/// prefetch run, when built outside the Makefile); 0 disables read-ahead
-/// (readahead.rs).
-pub(crate) const AMPR_EMU_PACK_READAHEAD_CHUNKS: u32 =
-    match option_env!("AMPR_PACK_READAHEAD_CHUNKS") {
-        Some(s) if s.len() == 1 && s.as_bytes()[0] == b'0' => 0,
-        Some(s) => super::runtime_memory::parse_size(s.as_bytes()) as u32,
-        None => 32,
-    };
-const _: () = assert!(AMPR_EMU_PACK_READAHEAD_CHUNKS <= 64);
-/// Read-ahead disk-saturation gate, from the Makefile's
-/// `AMPR_PACK_READAHEAD_MAX_DISK_INFLIGHT` (default 2): prefetch is skipped
-/// while the pack has at least this many physical backing reads in flight
-/// (readahead.rs); 0 disables prefetch starts entirely.
-pub(crate) const AMPR_EMU_PACK_READAHEAD_MAX_DISK_INFLIGHT: u32 =
-    match option_env!("AMPR_PACK_READAHEAD_MAX_DISK_INFLIGHT") {
-        Some(s) if s.len() == 1 && s.as_bytes()[0] == b'0' => 0,
-        Some(s) => super::runtime_memory::parse_size(s.as_bytes()) as u32,
-        None => 2,
-    };
-/// `AMPR_PACK_READAHEAD_HOT_ONLY` (default 1): read-ahead only for files
-/// with `AMPR_PACK_FILE_HOT` (readahead.rs `readahead_window_locked`);
-/// "0" applies it to every packed file, as before.
-pub(crate) const AMPR_EMU_PACK_READAHEAD_HOT_ONLY: bool =
-    match option_env!("AMPR_PACK_READAHEAD_HOT_ONLY") {
-        Some(s) => !(s.len() == 1 && s.as_bytes()[0] == b'0'),
-        None => true,
-    };
-/// `AMPR_PACK_SEQ_RUN` (default 3; 0 disables): consecutive forward read
-/// batches after which a fd without a HOT flag or a stream name is read as a
-/// sequential stream and gets the prefetch window (readahead.rs
-/// `readahead_window_locked`). The gate under `AMPR_PACK_READAHEAD_HOT_ONLY`
-/// so a file read front to back (a level, a `.la`/`.pak` asset bundle whose
-/// extension is not in the stream list) is prefetched once the pattern is
-/// clear, while a random-access file never reaches the run and is left alone.
-pub(crate) const AMPR_EMU_PACK_SEQ_RUN: u32 = match option_env!("AMPR_PACK_SEQ_RUN") {
-    Some(s) if s.len() == 1 && s.as_bytes()[0] == b'0' => 0,
-    Some(s) => super::runtime_memory::parse_size(s.as_bytes()) as u32,
-    None => 3,
-};
 pub(crate) const AMPR_EMU_PACK_DECODED_CACHE_MAX_BYTES: u64 = 512 * 1024 * 1024;
 /// Pipeline slots, from the Makefile's `AMPR_PACK_PIPELINES` (default 12,
 /// at most AMPR_EMU_PACK_PIPELINE_MAX) in both builds: each pipeline keeps a
@@ -722,25 +773,15 @@ const _: () = assert!(
         && super::tune::RELEASE_PIPELINES as usize <= AMPR_EMU_PACK_PIPELINE_SLOTS
         && AMPR_EMU_PACK_PIPELINE_SLOTS <= AMPR_EMU_PACK_PIPELINE_MAX
 );
+/// Decode workers and pread pool (rt/reactor/pread_pool.rs), below the
+/// reactor (256). On one title,
+/// whose GameThread runs at 300 and JobThread(High) at 500 on CPUs 0-7, game
+/// wait per read stayed in the run-to-run noise with the workers at 256
+/// (1,459 vs 1,434 us), and moving workers and pool to CPUs 8-12 (0x1f00)
+/// cost 9 us from queue to first step (debug /threads, /metrics).
 pub(crate) const AMPR_EMU_PACK_WORKER_PRIORITY: c_int = 384;
 pub(crate) const AMPR_EMU_PACK_WORKER_AFFINITY: u64 = 0x3f;
-/// Workers kept for the latency class (reads of at most 64 KiB), from the
-/// Makefile's `AMPR_PACK_LATENCY_RESERVE` (default 1; "0" for none). They
-/// come on top of AMPR_EMU_PACK_WORKERS at run time (state.rs: 4 + 1 ask
-/// for 5, which `buffer_split` fits with 11 pipelines in the same Buffer
-/// ledger). Applies only while more than one worker runs (schedule.rs
-/// `effective_latency_reserve_locked`).
-pub(crate) const AMPR_EMU_PACK_LATENCY_RESERVE_WORKERS: u32 =
-    match option_env!("AMPR_PACK_LATENCY_RESERVE") {
-        Some(s) if s.len() == 1 && s.as_bytes()[0] == b'0' => 0,
-        Some(s) => super::runtime_memory::parse_size(s.as_bytes()) as u32,
-        None => 1,
-    };
-const _: () = assert!(
-    AMPR_EMU_PACK_LATENCY_RESERVE_WORKERS < AMPR_EMU_PACK_WORKERS
-        && AMPR_EMU_PACK_WORKERS + AMPR_EMU_PACK_LATENCY_RESERVE_WORKERS
-            <= AMPR_EMU_PACK_WORKER_CAPACITY as u32
-);
+pub(crate) const AMPR_EMU_PACK_LATENCY_RESERVE_WORKERS: u32 = 0;
 pub(crate) const AMPR_EMU_PACK_LATENCY_READ_MAX_BYTES: u64 = 64 * 1024;
 pub(crate) const AMPR_EMU_PACK_BULK_READ_MIN_BYTES: u64 = 256 * 1024;
 pub(crate) const AMPR_EMU_PACK_IO_STAGING_BYTES: u64 = 2 * 1024 * 1024;
@@ -796,16 +837,26 @@ pub(crate) const AMPR_EMU_PACK_MAX_PACKS: usize = 1024;
 /// recently used closes to open another. A zstd title with 28 volumes kept
 /// all 18 of the old cap busy (debug /metrics).
 pub(crate) const AMPR_EMU_PACK_OPEN_PACK_FD_CAP: u32 = 32;
-/// 64 MiB (both builds; debug `decoded_mib`), the whole 64 MiB Cache
-/// ledger: the only pack cache. Exact reads with 64 MiB decoded gave 11-14%
-/// lower game wait per read than 32 + 32 MiB page reads on two zstd titles
-/// (debug /metrics). At 16 MiB a zstd title (debug /metrics, 150 s)
+/// The whole Cache ledger, the pool's remainder (rt/index_memory.rs
+/// `CACHE_MEMORY_MAX`: 30.64 MiB debug, 32 MiB release at the mount, then
+/// grown from the Index ledger; debug knob `decoded_mib`): the only pack
+/// cache, so the release cache is 1.36 MiB larger than the debug one. Exact reads with 64 MiB
+/// decoded gave 11-14% lower game wait per read than 32 + 32 MiB page reads
+/// on two zstd titles (debug /metrics). At 16 MiB a zstd title (debug /metrics, 150 s)
 /// re-decoded an evicted chunk in 73% of its misses: 29.9 GB decoded for
 /// 6.56 GB read. It is off when less than its 16 MiB minimum is left under
 /// the Cache cap.
-pub(crate) const AMPR_EMU_PACK_DECODED_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const AMPR_EMU_PACK_DECODED_CACHE_BYTES: u64 =
+    super::index_memory::CACHE_MEMORY_MAX as u64;
 pub(crate) const AMPR_EMU_PACK_DECODED_CACHE_MIN_BYTES: u64 = 16 * 1024 * 1024;
-pub(crate) const AMPR_EMU_PACK_CACHE_ENTRY_CAP: usize = 8192;
+/// Decoded cache entries. 8192 entries of 16 KiB blocks held 128 MiB,
+/// less than the 135 MiB cache before it grows from the Index ledger, so a
+/// title of small blocks evicted with pages free (debug
+/// `cache_cap_evictions`). 16384 covers 256 MiB of 16 KiB blocks. The
+/// entries live in `PackState`, in .bss outside the pool: 56 B each, so the
+/// change added 458,752 B to both builds (host test
+/// `cache_entries_are_56_bytes`).
+pub(crate) const AMPR_EMU_PACK_CACHE_ENTRY_CAP: usize = 16384;
 pub(crate) const AMPR_EMU_PACK_CACHE_PAGE_SHIFT: u32 = 14;
 pub(crate) const AMPR_EMU_PACK_CACHE_HASH_BUCKETS: usize = 16384;
 pub(crate) const AMPR_EMU_PACK_TOUCH_TABLE_SIZE: usize = 16384;
@@ -925,33 +976,15 @@ pub(crate) struct VirtualFdSlot {
     /// The value returned to the game: `AMPR_EMU_PACK_VIRTUAL_FD_BASE + slot`.
     /// A reused slot returns the same number, like a reused OS fd.
     pub handle: c_int,
-    /// First local chunk not yet covered by read-ahead (readahead.rs).
-    pub readahead_next: u32,
     pub cursor: u64,
     pub active: bool,
-    /// The open path names an audio or video stream (readahead.rs
-    /// `stream_path`): read-ahead and the latency class as for a HOT file,
-    /// for zstd and dump-forge LZ4 packs, whose indexes carry no such flag.
-    pub stream: bool,
-    /// Highest local chunk the previous read batch touched in this fd's file,
-    /// or u32::MAX before the first read; readahead.rs sequential detection.
-    pub last_touched: u32,
-    /// Consecutive forward read batches on this fd (readahead.rs
-    /// `readahead_window_locked`). At `AMPR_EMU_PACK_SEQ_RUN` the fd is read as
-    /// a stream even without a HOT flag or a stream name, so a file read front
-    /// to back (a level, a `.la`/`.pak` bundle) gets the prefetch window too.
-    pub seq_run: u32,
 }
 impl VirtualFdSlot {
     pub(crate) const EMPTY: Self = Self {
         file_id: 0,
         handle: -1,
-        readahead_next: 0,
         cursor: 0,
         active: false,
-        stream: false,
-        last_touched: u32::MAX,
-        seq_run: 0,
     };
 
     /// Open and still the slot of `fd`. A closed slot that has been reused
@@ -1042,12 +1075,12 @@ pub(crate) struct VirtualAioSlot {
     pub parked_ns: u64,
     pub park_kind: u8,
     pub requeued_ns: u64,
-    /// Nonzero: a read-ahead job (readahead.rs) loading this many chunks into the
-    /// decoded cache; no destination, no id, no game-visible completion.
-    pub prefetch_chunks: u32,
-    /// zstd: the split group this job is a child of (zstd_split), or
+    /// zstd: the split group this job is a child of (pack_split), or
     /// INVALID_INDEX.
     pub split_group: u32,
+    /// A packed POSIX read on the caller's thread (fd_read.rs `submit_sync`):
+    /// its waiter sleeps on AIO_CV, the reactor does not own it.
+    pub sync_read: bool,
 }
 impl VirtualAioSlot {
     pub(crate) const EMPTY: Self = Self {
@@ -1067,8 +1100,8 @@ impl VirtualAioSlot {
         parked_ns: 0,
         park_kind: 0,
         requeued_ns: 0,
-        prefetch_chunks: 0,
         split_group: INVALID_INDEX,
+        sync_read: false,
     };
 }
 
@@ -1147,6 +1180,12 @@ pub(crate) struct CacheEntry {
     pub pack_id: u16,
     pub state: CacheEntryState,
     pub referenced: bool,
+    /// Hits while cached, saturating; at `tune::cache_protect_hits` the
+    /// entry turns protected (caches.rs `cache_note_hit_locked`).
+    pub hits: u8,
+    /// In the protected segment: the hand skips it while the protected
+    /// bytes are within their share (caches.rs `cache_evict_one_locked`).
+    pub protected: bool,
     pub error: c_int,
 }
 impl CacheEntry {
@@ -1163,6 +1202,8 @@ impl CacheEntry {
         pack_id: 0,
         state: CacheEntryState::Free,
         referenced: false,
+        hits: 0,
+        protected: false,
         error: 0,
     };
 }
@@ -1293,8 +1334,16 @@ pub(crate) struct ReadPipelineContext {
     pub fd_reopen_retry: bool,
     pub native_accepted: bool,
     pub native_submitted: bool,
-    /// Physical backing reads this pipeline added to PACK_DISK_INFLIGHT (readahead.rs).
+    /// Physical backing reads this pipeline added to PACK_DISK_INFLIGHT
+    /// (worker.rs; debug build only, 0 in release).
     pub disk_inflight: u32,
+    /// The game destination was checked in this pass and found mapped
+    /// CPU-writable (pack/virtual_read.rs ensure_destination). Cleared at
+    /// every pass, so a yield rechecks and tasks in one pass share it.
+    pub dest_checked: bool,
+    /// The one deadline for this job's destination walk, 0 before the first
+    /// wait: a wait ends here however many tasks follow (640 ms).
+    pub dest_deadline_ns: u64,
 }
 impl ReadPipelineContext {
     pub(crate) const EMPTY: Self = Self {
@@ -1326,6 +1375,8 @@ impl ReadPipelineContext {
         native_accepted: false,
         native_submitted: false,
         disk_inflight: 0,
+        dest_checked: false,
+        dest_deadline_ns: 0,
     };
 }
 
@@ -1341,8 +1392,9 @@ pub(crate) struct PackSubmission {
 // Non-zero defaults `pack_state_create` (state.rs) must apply in place on the
 // zeroed storage: every array element = its type's `EMPTY` (virtual_fds,
 // virtual_directories, virtual_aio, pipelines, pack_handles, cache_entries;
-// the others are all-zero), queue_head/queue_tail =
-// prefetch_head/prefetch_tail = INVALID_INDEX, decoded_cache_target_bytes
+// the others are all-zero), queue_head/queue_tail and
+// retained_head/retained_tail = INVALID_INDEX,
+// decoded_cache_target_bytes
 // and requested_workers from `tune` (in release
 // AMPR_EMU_PACK_DECODED_CACHE_BYTES and AMPR_EMU_PACK_WORKERS),
 // latency_reserve_workers = AMPR_EMU_PACK_LATENCY_RESERVE_WORKERS,
@@ -1369,18 +1421,20 @@ pub(crate) struct PackState {
     pub virtual_directory_cursor: u32,
     pub virtual_aio: [VirtualAioSlot; AMPR_EMU_PACK_VIRTUAL_AIO_SLOTS],
     pub virtual_aio_cursor: u32,
+    /// Slots not Free (slots.rs allocate/free), so a split read checks its
+    /// room without scanning all 256 slots under PACK_M.
+    pub virtual_aio_used: u32,
     pub virtual_aio_groups: [VirtualAioGroupSlot; AMPR_EMU_PACK_VIRTUAL_AIO_SLOTS],
     pub virtual_aio_group_cursor: u32,
     pub queue_head: [[u32; PACK_WORK_CLASS_COUNT]; 3],
     pub queue_tail: [[u32; PACK_WORK_CLASS_COUNT]; 3],
+    /// Jobs queued while holding a pipeline (schedule.rs), apart from new
+    /// ones so a pop with no pipeline free takes a list head, no walk.
+    pub retained_head: [[u32; PACK_WORK_CLASS_COUNT]; 3],
+    pub retained_tail: [[u32; PACK_WORK_CLASS_COUNT]; 3],
     pub queue_depth: [u32; PACK_WORK_CLASS_COUNT],
     pub queue_pick_counter: u32,
     pub aio_completion_epoch: u64,
-    /// Read-ahead jobs not yet started (linked by `next`), and the chunks of
-    /// all read-ahead jobs in flight (readahead.rs).
-    pub prefetch_head: u32,
-    pub prefetch_tail: u32,
-    pub prefetch_chunks_inflight: u32,
 
     pub decoded_cache_target_bytes: usize,
     pub requested_workers: u32,
@@ -1392,7 +1446,6 @@ pub(crate) struct PackState {
     pub cache_waiter_count: u32,
     pub fd_waiter_count: u32,
     pub workers_started: u32,
-    pub worker_capacity: u32,
     pub pipeline_active_count: u32,
 
     pub pack_handles: [PackHandle; AMPR_EMU_PACK_MAX_PACKS],
@@ -1412,6 +1465,8 @@ pub(crate) struct PackState {
     /// One past the highest entry index ever allocated: the LIFO free list
     /// hands out low indices first, so the CLOCK hand scans only below it.
     pub cache_entry_high_water: u32,
+    /// Bytes (whole pages) of the protected entries; CACHE_MUTEX.
+    pub cache_protected_bytes: usize,
     pub touches: [TouchEntry; AMPR_EMU_PACK_TOUCH_TABLE_SIZE],
 }
 
@@ -1443,11 +1498,8 @@ pub(crate) static DIRECTORY_MUTEXES: [Mutex; AMPR_EMU_PACK_VIRTUAL_DIRECTORY_SLO
 pub(crate) static QUEUE_CV: Condvar = Condvar::new();
 pub(crate) static AIO_CV: Condvar = Condvar::new();
 pub(crate) static SUBMIT_CV: Condvar = Condvar::new();
-pub(crate) static CACHE_CVS: [Condvar; PACK_CACHE_WAIT_BUCKET_COUNT] =
-    [const { Condvar::new() }; PACK_CACHE_WAIT_BUCKET_COUNT];
 pub(crate) static MANIFEST_CV: Condvar = Condvar::new();
 pub(crate) static LOAD_STATE: AtomicU32 = AtomicU32::new(PACK_LOAD_UNINITIALIZED);
-pub(crate) static PROFILE_STARTED_WORKERS: AtomicU32 = AtomicU32::new(0);
 pub(crate) static PACK_FD_PROGRESS_EPOCH: AtomicU64 = AtomicU64::new(1);
 pub(crate) static PACK_FD_WAITER_COUNT: AtomicU32 = AtomicU32::new(0);
 pub(crate) static WORKER_STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -1474,6 +1526,18 @@ mod tests {
         PackFormat::Zstd,
         PackFormat::Pkg,
     ];
+
+    /// The entry array is .bss outside the pool, so its size feeds the
+    /// pool recompute (AGENTS.md memory budget): a change here moves both
+    /// PRX totals.
+    #[test]
+    fn cache_entries_are_56_bytes() {
+        assert_eq!(core::mem::size_of::<CacheEntry>(), 56);
+        assert_eq!(
+            core::mem::size_of::<[CacheEntry; AMPR_EMU_PACK_CACHE_ENTRY_CAP]>(),
+            917_504
+        );
+    }
 
     #[test]
     fn pack_format_round_trips_through_u8() {
@@ -1537,5 +1601,40 @@ mod tests {
             GATE.wait_drained(|| false),
             "an empty gate drains without a pause"
         );
+    }
+
+    extern "C" {
+        /// Host libc rmdir; the console one is resolved from libkernel.
+        fn rmdir(path: *const c_char) -> c_int;
+    }
+
+    /// The last step of `remove_old_cache_dir` on the host filesystem: an
+    /// emptied folder goes, a missing one is no error, and a folder that
+    /// still holds a file stays; errno is kept each time.
+    #[test]
+    fn old_cache_folder_goes_once_empty_and_a_named_file_keeps_it() {
+        let dir = std::env::temp_dir().join(format!("ampr_cache_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let c_dir = std::ffi::CString::new(dir.to_str().unwrap()).unwrap();
+        set_errno(EMFILE);
+        unsafe { remove_dir_keeping_errno(&c_dir, rmdir) };
+        assert_eq!(errno(), EMFILE);
+        assert!(!dir.exists());
+
+        // Missing folder: ENOENT is ignored.
+        set_errno(ENOSPC);
+        unsafe { remove_dir_keeping_errno(&c_dir, rmdir) };
+        assert_eq!(errno(), ENOSPC);
+
+        // A file left behind: ENOTEMPTY is ignored, the folder stays.
+        let file = dir.join("00000001.tmp");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(&file, b"x").unwrap();
+        set_errno(0);
+        unsafe { remove_dir_keeping_errno(&c_dir, rmdir) };
+        assert_eq!(errno(), 0);
+        assert!(file.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

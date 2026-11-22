@@ -29,21 +29,16 @@ impl AprAioReactor {
             self.clear_cursor_read_wait_hint(lane);
             let mut priorReadFencePending = false;
             let mut priorNativeBatchPending = false;
-            let mut speculativeCommandUsed = false;
             let mut readIssueBudget = ReadIssueBudget {
                 requestsLeft: crate::rt::tune::read_chunk_quantum(),
                 bytesLeft: crate::rt::tune::read_pass_bytes(),
                 held: false,
             };
-            // Set once an earlier job of this lane was passed with completion
-            // commands left (lane_overlap.rs): later jobs keep the prior read
-            // fence and stay off the native batch and AMM engine.
-            let mut priorLaneOverlap = false;
             let mut job = laneHeads[lane];
             while !job.is_null() {
                 if self.native_batch_wait_pending(lane as u32) {
                     if unsafe { !(*job).priorityNext.load(Ordering::Acquire).is_null() } {
-                        lane_overlap::note_lane_block(lane_overlap::LaneBlock::Wait);
+                        note_lane_block(LaneBlock::Wait);
                     }
                     break;
                 }
@@ -52,47 +47,29 @@ impl AprAioReactor {
                     &mut job,
                     priorReadFencePending,
                     priorNativeBatchPending,
-                    priorLaneOverlap,
-                    &mut speculativeCommandUsed,
                     &mut readIssueBudget,
                     &mut admission,
                 );
                 // A synchronously released/failed head is a pass boundary; a
-                // blocked or partially admitted head keeps the lane. With
-                // lane_eop_overlap the released head's successor is the new
-                // head and runs in this pass (lane_overlap.rs
-                // lane_release_cascades): only the head is ever released, so
-                // the prior flags are still false here.
+                // blocked or partially admitted head keeps the lane.
                 if job.is_null() {
-                    if lane_overlap::lane_release_cascades() && !next.is_null() {
-                        job = next;
-                        continue;
-                    }
                     break;
                 }
                 let j = unsafe { &mut *job };
                 let nativeSubmitted = j.nativeSubmitted.load(Ordering::Acquire);
-                let mut overlapped = false;
                 if j.sourceOffset != j.sourceBytes {
-                    overlapped = Self::lane_eop_overlap_allows(j, nativeSubmitted);
-                    if !overlapped {
-                        if !next.is_null() {
-                            Self::note_lane_successor_blocked(j);
-                        }
-                        break;
+                    if !next.is_null() {
+                        Self::note_lane_successor_blocked(j);
                     }
+                    break;
                 } else if !Self::job_allows_priority_successor(j, nativeSubmitted) {
                     if !next.is_null() {
-                        lane_overlap::note_lane_block(lane_overlap::LaneBlock::Other);
+                        note_lane_block(LaneBlock::Other);
                     }
                     break;
                 }
-                priorLaneOverlap |= overlapped;
-                priorReadFencePending = lane_overlap::lane_successor_prior_fence(
-                    priorReadFencePending,
-                    Self::job_has_outstanding_reads(j),
-                    overlapped,
-                );
+                // The successor's EOPs wait while any earlier job still reads.
+                priorReadFencePending |= Self::job_has_outstanding_reads(j);
                 priorNativeBatchPending |=
                     nativeSubmitted && j.nativeMicroEngine == NativeMicroEngine::AprBatch;
                 job = next;
@@ -138,7 +115,6 @@ impl AprAioReactor {
             if job.is_null()
                 || chain.is_null()
                 || Self::job_failed(unsafe { &*job })
-                || Self::cross_eop_suffix_is_canceled(unsafe { &*job }, active.desc.errorOff)
             {
                 if !chain.is_null() {
                     unsafe { (*chain).allIssued = true };
@@ -281,29 +257,26 @@ impl AprAioReactor {
         {
             abort();
         }
-        for requestIndex in 0..external.requestCount {
-            let id = external.aioIds[requestIndex as usize];
-            if id < 0 {
-                continue;
-            }
-            if batch.count >= kAioPollBatchLimit {
-                abort();
-            }
-            #[cfg(debug_assertions)]
-            if batch.ids[..batch.count].contains(&id) {
-                abort();
-            }
-            let item = batch.count;
-            batch.count += 1;
-            batch.items[item].external = ExternalAioRef {
-                slot: slotIndex,
-                generation: external.generation,
-            };
-            batch.items[item].isExternal = true;
-            batch.items[item].externalRequestIndex = requestIndex;
-            batch.ids[item] = id;
-            batch.states[item] = i32::MIN;
+        let id = external.aioId;
+        if id < 0 {
+            return;
         }
+        if batch.count >= kAioPollBatchLimit {
+            abort();
+        }
+        #[cfg(debug_assertions)]
+        if batch.ids[..batch.count].contains(&id) {
+            abort();
+        }
+        let item = batch.count;
+        batch.count += 1;
+        batch.items[item].external = ExternalAioRef {
+            slot: slotIndex,
+            generation: external.generation,
+        };
+        batch.items[item].isExternal = true;
+        batch.ids[item] = id;
+        batch.states[item] = i32::MIN;
     }
 
     pub(crate) fn record_aio_delete_failure(
@@ -325,16 +298,14 @@ impl AprAioReactor {
     pub(crate) fn handle_external_delete_failure(
         &self,
         external: &mut ExternalAioRead,
-        requestIndex: u32,
         nowNs: u64,
         _rc: c_int,
     ) {
-        let i = requestIndex as usize;
         // A failed delete does not retire the ID; the kernel may still own the
         // buffer, so a timed-out delete is fatal.
         if Self::record_aio_delete_failure(
-            &mut external.deleteRetries[i],
-            &mut external.deleteFirstFailureNs[i],
+            &mut external.deleteRetries,
+            &mut external.deleteFirstFailureNs,
             nowNs,
         ) {
             abort();
@@ -346,15 +317,11 @@ impl AprAioReactor {
     /// Live external slot for a batch item, or abort when stale.
     fn poll_batch_external(&mut self, batch: &AioPollBatch, item: usize) -> *mut ExternalAioRead {
         let external = self.external_aio_at(&batch.items[item].external);
-        let requestIndex = batch.items[item].externalRequestIndex;
         if external.is_null() {
             abort();
         }
         let e = unsafe { &*external };
-        if e.state != ExternalAioState::Submitted
-            || requestIndex >= e.requestCount
-            || e.aioIds[requestIndex as usize] != batch.ids[item]
-        {
+        if e.state != ExternalAioState::Submitted || e.aioId != batch.ids[item] {
             abort();
         }
         external
@@ -409,7 +376,7 @@ impl AprAioReactor {
                 // ID through the common delete batch.
                 if !active.is_null() && unsafe { !(*active).job.is_null() } {
                     let a = unsafe { &*active };
-                    self.set_or_defer_read_command_error(
+                    self.set_command_error(
                         unsafe { &mut *a.job },
                         c"aio-poll".as_ptr(),
                         apr_backend_read_error_to_apr(apr_aio_api_rc_to_sce(state)),
@@ -424,13 +391,7 @@ impl AprAioReactor {
             let terminal = finalState == SCE_KERNEL_AIO_STATE_COMPLETED
                 || finalState == SCE_KERNEL_AIO_STATE_ABORTED;
             if statPollNs != 0 {
-                Self::stat_observe_poll(
-                    external,
-                    active,
-                    batch.items[item].externalRequestIndex,
-                    terminal,
-                    statPollNs,
-                );
+                Self::stat_observe_poll(external, active, terminal, statPollNs);
             }
             if terminal {
                 terminalItems[terminalCount] = item;
@@ -485,10 +446,9 @@ impl AprAioReactor {
             let batchItem = batch.items[item];
             if batchItem.isExternal {
                 let e = unsafe { &mut *self.poll_batch_external(batch, item) };
-                let requestIndex = batchItem.externalRequestIndex;
                 let deleteSceRc = apr_aio_api_rc_to_sce(deleteResults[terminal]);
                 if deleteSceRc != 0 {
-                    self.handle_external_delete_failure(e, requestIndex, pollEndNs, deleteSceRc);
+                    self.handle_external_delete_failure(e, pollEndNs, deleteSceRc);
                     if e.nextPollTimeNs <= pollEndNs {
                         self.schedule_next_external_aio_poll(e, pollEndNs);
                     }
@@ -497,7 +457,7 @@ impl AprAioReactor {
                 if e.remainingCount == 0 {
                     abort();
                 }
-                e.aioIds[requestIndex as usize] = -1;
+                e.aioId = -1;
                 e.remainingCount -= 1;
                 if self.externalAioSubmittedCount.load(Ordering::Acquire) == 0 {
                     abort();
@@ -565,21 +525,16 @@ impl AprAioReactor {
     fn stat_observe_poll(
         external: *mut ExternalAioRead,
         active: *mut ActiveRead,
-        requestIndex: u32,
         terminal: bool,
         nowNs: u64,
     ) {
         let (submitNs, lastPollNs, polls, bytes, ext) =
             if let Some(e) = unsafe { external.as_mut() } {
-                let i = requestIndex as usize;
-                if i >= kAprExternalAioGroupMaxRequests {
-                    return;
-                }
-                let bytes = e.requests[i].nbyte as u64;
+                let bytes = e.request.nbyte as u64;
                 (
-                    &mut e.statSubmitNs[i],
-                    &mut e.statLastPollNs[i],
-                    &mut e.statPolls[i],
+                    &mut e.statSubmitNs,
+                    &mut e.statLastPollNs,
+                    &mut e.statPolls,
                     bytes,
                     true,
                 )
@@ -625,5 +580,205 @@ impl AprAioReactor {
             stats::add(Stat::AprPolls, pollCount);
             stats::add(Stat::AprDetectNs, detectNs);
         }
+    }
+}
+
+// ---- lane block diagnostics ----
+
+/// A command that only tells the game the job's earlier work is done: the
+/// at-completion forms of WriteAddress, WriteCounter, WriteKernelEventQueue
+/// and the WriteAddressFrom{TimeCounter,Counter,CounterPair} writes (the
+/// `_04_00` exports decode to the same op types). It ends job_notify_ns
+/// (native.rs) and classifies a parked head (lane_block_kind).
+pub(crate) fn lane_completion_signals(op: &Op) -> bool {
+    match op.op_type {
+        WRITE_ADDRESS
+        | WRITE_EQUEUE
+        | WRITE_COUNTER
+        | WRITE_ADDRESS_FROM_TIME_COUNTER
+        | WRITE_ADDRESS_FROM_COUNTER
+        | WRITE_ADDRESS_FROM_COUNTER_PAIR => !AprAioReactor::software_op_is_sop(op),
+        _ => false,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LaneBlock {
+    Fence,
+    Wait,
+    Other,
+}
+
+/// Why a head with source left stops its lane: `cursorOp` is the decoded
+/// command parked at its source cursor (None if not cached), `fencePending`
+/// whether its own reads or a deferred native EOP are still outstanding.
+pub(crate) fn lane_block_kind(cursorOp: Option<&Op>, fencePending: bool) -> LaneBlock {
+    match cursorOp {
+        Some(op) if matches!(op.op_type, WAIT_ON_ADDRESS | WAIT_ON_COUNTER) => LaneBlock::Wait,
+        Some(op) if fencePending && lane_completion_signals(op) => LaneBlock::Fence,
+        _ => LaneBlock::Other,
+    }
+}
+
+pub(crate) fn note_lane_block(kind: LaneBlock) {
+    let s = match kind {
+        LaneBlock::Fence => Stat::LaneSuccessorBlockedFence,
+        LaneBlock::Wait => Stat::LaneSuccessorBlockedWait,
+        LaneBlock::Other => Stat::LaneSuccessorBlockedOther,
+    };
+    stats::add(s, 1);
+}
+
+impl AprAioReactor {
+    /// The decoded command parked at the job's source cursor, if cached.
+    fn lane_cursor_op(j: &JobState) -> Option<&Op> {
+        (j.decodedOpCacheBytes != 0 && j.decodedOpCache.buf_offset_bytes == j.sourceOffset)
+            .then_some(&j.decodedOpCache)
+    }
+
+    /// mem_report: the head before `succ` is being released. If `succ`'s
+    /// reads are all done and it is parked on a completion command, it was
+    /// held by lane order since its last read finished: job_order_wait_ns.
+    /// Its job_notify_ns span keeps running (statReadDoneNs is not taken).
+    pub(crate) fn note_successor_order_wait(succ: &JobState) {
+        #[cfg(feature = "mem_report")]
+        let start = succ.statReadDoneNs;
+        #[cfg(not(feature = "mem_report"))]
+        let start = 0u64;
+        if start != 0
+            && !Self::job_failed(succ)
+            && !Self::job_has_outstanding_reads(succ)
+            && Self::lane_cursor_op(succ).is_some_and(lane_completion_signals)
+        {
+            stats::add(Stat::JobOrderWaits, 1);
+            stats::add(Stat::JobOrderWaitNs, stats::since(start));
+        }
+    }
+
+    /// Records why the lane loop stops before `j`'s queued successor.
+    pub(crate) fn note_lane_successor_blocked(j: &JobState) {
+        if !crate::rt::tune::ON {
+            return;
+        }
+        let fencePending =
+            j.completedReadSeq < j.latestSubmittedReadSeq || j.nativeBatchReleasePending;
+        note_lane_block(lane_block_kind(Self::lane_cursor_op(j), fencePending));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::vec::Vec;
+
+    fn op(op_type: OpType) -> Op {
+        Op {
+            op_type,
+            ..Op::default()
+        }
+    }
+    fn write(op_type: OpType, sop: bool) -> Op {
+        let mut o = op(op_type);
+        o.ptra = 0x1000;
+        o.u64a = 7;
+        o.u64b = 0x2000;
+        o.u32b = 3;
+        match op_type {
+            WRITE_ADDRESS | WRITE_EQUEUE => o.u8a = sop as u8,
+            WRITE_COUNTER => {
+                o.u8b = 1;
+                o.u32c = sop as u32;
+            }
+            _ => o.u8b = sop as u8,
+        }
+        o
+    }
+    const WRITES: [OpType; 6] = [
+        WRITE_ADDRESS,
+        WRITE_EQUEUE,
+        WRITE_COUNTER,
+        WRITE_ADDRESS_FROM_TIME_COUNTER,
+        WRITE_ADDRESS_FROM_COUNTER,
+        WRITE_ADDRESS_FROM_COUNTER_PAIR,
+    ];
+    fn nop() -> Op {
+        let mut o = op(NOP);
+        o.u32a = 1;
+        o
+    }
+    fn read_file() -> Op {
+        let mut o = op(APR_READ_FILE);
+        o.u32a = 1;
+        o.ptra = 0x10000;
+        o.u64a = 4096;
+        o
+    }
+    fn wait_address() -> Op {
+        let mut o = op(WAIT_ON_ADDRESS);
+        o.ptra = 0x1000;
+        o.u64a = 1;
+        o
+    }
+
+    #[test]
+    fn completion_signals_are_eop_writes_also_after_decode() {
+        for t in WRITES {
+            assert!(lane_completion_signals(&write(t, false)), "{t}");
+            assert!(!lane_completion_signals(&write(t, true)), "sop {t}");
+        }
+        for t in [
+            NOP,
+            MARKER_POP,
+            APR_READ_FILE,
+            APR_READ_GATHER_SCATTER,
+            APR_RESET_GATHER_SCATTER,
+            APR_MAP_BEGIN,
+            APR_MAP_END,
+            WAIT_ON_ADDRESS,
+            WAIT_ON_COUNTER,
+            AMM_MAP,
+        ] {
+            assert!(!lane_completion_signals(&op(t)), "{t}");
+        }
+        // Packed and decoded again, every op keeps its class.
+        let mut ops: Vec<Op> = WRITES.iter().map(|&t| write(t, false)).collect();
+        ops.extend(WRITES.iter().map(|&t| write(t, true)));
+        ops.extend([nop(), op(MARKER_POP), read_file(), wait_address()]);
+        let (mut buf, mut offs) = (Vec::new(), Vec::new());
+        for o in &ops {
+            offs.push(buf.len() as u32);
+            let (w, n) = o.encode_words().unwrap();
+            for x in &w[..n] {
+                buf.extend_from_slice(&x.to_ne_bytes());
+            }
+        }
+        for (o, &off) in ops.iter().zip(&offs) {
+            let (mut d, mut n, mut e) = (Op::default(), 0u32, 0u32);
+            let rc = unsafe {
+                ampr_decode_apr_packed_op(
+                    buf.as_ptr().cast(),
+                    buf.len() as u32,
+                    off,
+                    &mut d,
+                    &mut n,
+                    &mut e,
+                )
+            };
+            assert_eq!(rc, 0, "{}", o.op_type);
+            assert_eq!(d.op_type, o.op_type);
+            assert_eq!(lane_completion_signals(&d), lane_completion_signals(o), "{}", o.op_type);
+        }
+    }
+
+    #[test]
+    fn block_kind_follows_the_parked_command() {
+        let eop = write(WRITE_ADDRESS, false);
+        assert_eq!(lane_block_kind(Some(&eop), true), LaneBlock::Fence);
+        assert_eq!(lane_block_kind(Some(&eop), false), LaneBlock::Other);
+        assert_eq!(lane_block_kind(Some(&wait_address()), false), LaneBlock::Wait);
+        assert_eq!(lane_block_kind(Some(&op(WAIT_ON_COUNTER)), true), LaneBlock::Wait);
+        assert_eq!(lane_block_kind(Some(&read_file()), true), LaneBlock::Other);
+        assert_eq!(lane_block_kind(Some(&nop()), true), LaneBlock::Other);
+        assert_eq!(lane_block_kind(None, true), LaneBlock::Other);
     }
 }

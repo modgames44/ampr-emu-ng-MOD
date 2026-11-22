@@ -2,7 +2,6 @@
 
 use super::*;
 use core::ptr::addr_of_mut;
-use core::sync::atomic::AtomicU8;
 
 pub unsafe fn ampr_pack_try_getdents_fd(
     fd: c_int,
@@ -31,10 +30,11 @@ unsafe fn clear_handled(handled: *mut bool) {
 
 // ---- ordinary virtual fd reads -----------------------------------------------
 //
-// read/pread/readv/preadv of a virtual pack fd submit one virtual AIO
-// request per iovec segment (aio.rs) and wait for them (aio_wait.rs), so chunks are
-// read and decoded only on the pack workers, each with its own decoder. The
-// caller sleeps on AIO_CV like a game's own sceKernelAioWaitRequests. pread*
+// read/pread/readv/preadv of a virtual pack fd queue one virtual job per
+// iovec segment and wait for them on the caller's thread (sync reads,
+// below), so chunks are read and decoded only on the pack workers, each with
+// its own decoder. The caller sleeps on AIO_CV like a game's own
+// sceKernelAioWaitRequests, without the AIO ids. pread*
 // leave the slot cursor alone; read* and lseek hold the slot's
 // VIRTUAL_FD_MUTEXES entry (close takes it too) while they use and move the
 // cursor. Results are byte counts or SCE error codes; the posix_* hooks
@@ -210,52 +210,53 @@ unsafe fn completion_epoch() -> u64 {
     unsafe { (*state).aio_completion_epoch }
 }
 
+// ---- sync reads on the caller's thread ---------------------------------------
+//
+// A packed read/pread/readv/preadv queues its pack jobs and waits for them
+// on the caller's own thread, as upstream does (ampr_emu_pack.cpp:6416).
+// Before, a read thread took every call (caller -> read thread -> worker ->
+// read thread -> caller: 4 hops on a cache hit, 8 on a miss) because the
+// AIO API arrays sized for 128 requests needed about 32 KB of the caller's
+// stack (read_on_workers 12,024 B, sceKernelAioSubmitReadCommandsMultiple
+// 13,528 B, publish_virtual_jobs 6,600 B in the debug PRX) and a game's
+// video I/O thread faulted on the guard page in publish_virtual_jobs. This
+// path skips the AIO ids: it reserves the jobs under PACK_M, queues them,
+// sleeps on AIO_CV until every job is Done and frees them, with arrays for
+// SYNC_BATCH segments: 0x748 B of frames from virtual_read down to the queue
+// push in both PRX builds (read_on_workers 0x2e8), budgeted at 0x1000 in
+// tools/check_stack_frames.py. The read hand-off threads, their 4 x 128 KiB
+// stacks and their load group are gone.
+
+/// Segments queued per round: one per iovec segment, so a pread is one round;
+/// a read over >= 2 chunks still splits into parallel child jobs
+/// (`prepare_virtual_request_locked`). 8 keeps the round's arrays small
+/// (8 x 24 B plan, 8 x 16 B results, 8 x 8 B jobs).
+const SYNC_BATCH: usize = 8;
+
 /// Reads `[offset, offset + length)` (already clamped to EOF, nonzero) of
-/// virtual fd `fd` into `vector` on the pack workers: batches of one AIO
-/// request per segment, submitted and waited for here, so chunks decode only
-/// on workers (each owns one decoder). Returns `length`, the bytes before the
-/// first short or failed request (a partial read), or that error when nothing
-/// was read.
+/// virtual fd `fd` into `vector` on the pack workers, SYNC_BATCH segments at
+/// a time, so chunks decode only on workers (each owns one decoder). Returns
+/// `length`, the bytes before the first short or failed request (a partial
+/// read), or that error when nothing was read.
+#[inline(never)]
 unsafe fn read_on_workers(
     fd: c_int,
     vector: &[SceKernelIovec],
     offset: u64,
     length: u64,
 ) -> ssize_t {
-    const N: usize = SCE_KERNEL_AIO_REQUEST_NUM_MAX;
     let mut done = 0u64;
     while done < length {
-        let mut plan = [(0u64, null_mut::<u8>(), 0usize); N];
+        let mut plan = [(0u64, null_mut::<u8>(), 0usize); SYNC_BATCH];
         let count = plan_segment_reads(vector, offset, length, done, &mut plan);
         if count == 0 {
             break;
         }
-        let mut results = [SceKernelAioResult {
-            return_value: 0,
-            state: 0,
-        }; N];
-        let mut requests = [SceKernelAioRWRequest::EMPTY; N];
-        for i in 0..count {
-            let (at, buf, nbyte) = plan[i];
-            requests[i] = SceKernelAioRWRequest {
-                offset: at as off_t,
-                nbyte,
-                buf: buf.cast(),
-                result: unsafe { results.as_mut_ptr().add(i) },
-                fd,
-            };
-        }
-        let mut ids = [0 as SceKernelAioSubmitId; N];
+        let mut results = [SceKernelAioResult::EMPTY; SYNC_BATCH];
+        let mut jobs = [(INVALID_INDEX, INVALID_INDEX); SYNC_BATCH];
         let mut backoff: Option<SubmitBackoff> = None;
         let rc = loop {
-            let rc = unsafe {
-                sceKernelAioSubmitReadCommandsMultiple(
-                    requests.as_mut_ptr(),
-                    count as c_int,
-                    SCE_KERNEL_AIO_PRIORITY_HIGH,
-                    ids.as_mut_ptr(),
-                )
-            };
+            let rc = unsafe { submit_sync(fd, &plan[..count], &mut results, &mut jobs) };
             if rc != SCE_KERNEL_ERROR_EAGAIN {
                 break rc;
             }
@@ -275,25 +276,8 @@ unsafe fn read_on_workers(
                 rc as ssize_t
             };
         }
-        let mut states = [0 as c_int; N];
-        let wait_rc = unsafe {
-            sceKernelAioWaitRequests(
-                ids.as_mut_ptr(),
-                count as c_int,
-                states.as_mut_ptr(),
-                SCE_KERNEL_AIO_WAIT_AND,
-                null_mut(),
-            )
-        };
-        if wait_rc != 0 {
-            // An untimed wait on our own virtual ids cannot fail; returning
-            // would leave workers writing into this frame's `results`.
-            abort();
-        }
-        let mut deleted = [0 as c_int; N];
-        let _ = unsafe {
-            sceKernelAioDeleteRequests(ids.as_mut_ptr(), count as c_int, deleted.as_mut_ptr())
-        };
+        // Returns only once every job is done: workers write `results`.
+        unsafe { wait_sync(&jobs[..count]) };
         for i in 0..count {
             let rv = results[i].return_value;
             if rv < 0 {
@@ -315,19 +299,210 @@ unsafe fn read_on_workers(
     }
 }
 
-// ---- read threads ----------------------------------------------------------
+/// scePthreadSetcancelstate(state, old). PTHREAD_CANCEL_DISABLE is 1 in the
+/// FreeBSD thread library libkernel derives from.
+static SET_CANCEL_STATE: crate::rt::sys::LazySym =
+    crate::rt::sys::LazySym::new(c"scePthreadSetcancelstate");
+/// The POSIX entry libkernel also exports, if the sce one is missing.
+static SET_CANCEL_STATE_POSIX: crate::rt::sys::LazySym =
+    crate::rt::sys::LazySym::new(c"pthread_setcancelstate");
+type SetCancelStateFn = unsafe extern "C" fn(c_int, *mut c_int) -> c_int;
+const CANCEL_DISABLE: c_int = 1;
 
-/// `read_on_workers` on the caller's own thread, for a read with no read
-/// thread to hand it to. Its frames need about 32 KB (below), so the debug
-/// build counts these reads and the stack their callers had left.
-unsafe fn read_inline(
+/// Turns cancellation off for the calling game thread while its read is in
+/// flight: the wait (`wait_sync`) is a cancellation point, and a thread
+/// cancelled there would leave workers writing into its dead stack
+/// (`results`, the iovec buffers) and its job slots never freed. Returns the
+/// state to restore, None when libkernel lacks the call or refuses; the read
+/// then runs anyway, as it did before this guard, and the debug build counts
+/// it (`posix_read_cancel_on`) so a console shows whether that ever happens.
+#[inline(never)]
+fn no_cancel() -> Option<c_int> {
+    let old = cancel_state_fn().and_then(|set| {
+        let mut old: c_int = 0;
+        (unsafe { set(CANCEL_DISABLE, &mut old) } == 0).then_some(old)
+    });
+    if old.is_none() {
+        stats::add(stats::Stat::PosixReadCancelOn, 1);
+    }
+    old
+}
+
+/// scePthreadSetcancelstate, else pthread_setcancelstate (same arguments;
+/// PTHREAD_CANCEL_DISABLE is 1 in both).
+fn cancel_state_fn() -> Option<SetCancelStateFn> {
+    unsafe { SET_CANCEL_STATE.get::<SetCancelStateFn>() }
+        .or_else(|| unsafe { SET_CANCEL_STATE_POSIX.get::<SetCancelStateFn>() })
+}
+
+/// Restores the state `no_cancel` replaced; a cancel asked meanwhile acts at
+/// the thread's next cancellation point, after the read is done.
+#[inline(never)]
+fn restore_cancel(old: Option<c_int>) {
+    let Some(old) = old else { return };
+    if let Some(set) = cancel_state_fn() {
+        let mut prev: c_int = 0;
+        unsafe { set(old, &mut prev) };
+    }
+}
+
+/// Reserves and queues one job per `plan` entry, all or none; one over two
+/// or more chunks splits into children. `jobs[i]` gets (slot, split group
+/// or INVALID_INDEX) and each result is zeroed. EAGAIN while the virtual
+/// AIO table is full, as the AIO submit.
+unsafe fn submit_sync(
     fd: c_int,
-    vector: &[SceKernelIovec],
-    offset: u64,
-    length: u64,
-) -> ssize_t {
-    note_inline_read();
-    unsafe { read_on_workers(fd, vector, offset, length) }
+    plan: &[(u64, *mut u8, usize)],
+    results: &mut [SceKernelAioResult; SYNC_BATCH],
+    jobs: &mut [(u32, u32); SYNC_BATCH],
+) -> c_int {
+    let Some(fd_index) = decode_virtual_fd(fd) else {
+        return SCE_KERNEL_ERROR_EBADF;
+    };
+    let state = unsafe { pack_state() };
+    let notify_one;
+    {
+        let _lock = PACK_M.lock();
+        let rc = unsafe { submit_sync_locked(state, fd, fd_index, plan, results, jobs) };
+        if rc != 0 {
+            return rc;
+        }
+        let mut queued = 0usize;
+        for &job in &jobs[..plan.len()] {
+            queued += unsafe {
+                for_each_job_locked(state, job, |i| queue_push_locked(state, i))
+            };
+        }
+        notify_one = queued == 1 && unsafe { effective_latency_reserve_locked(state) } == 0;
+    }
+    if notify_one {
+        QUEUE_CV.notify_one();
+    } else {
+        QUEUE_CV.notify_all();
+    }
+    0
+}
+
+/// Under PACK_M: the reserve half of `submit_sync`; on failure frees what it
+/// reserved.
+unsafe fn submit_sync_locked(
+    state: *mut PackState,
+    fd: c_int,
+    fd_index: u32,
+    plan: &[(u64, *mut u8, usize)],
+    results: &mut [SceKernelAioResult; SYNC_BATCH],
+    jobs: &mut [(u32, u32); SYNC_BATCH],
+) -> c_int {
+    let mut rc = 0;
+    let mut prepared = 0usize;
+    for (i, &(at, buf, nbyte)) in plan.iter().enumerate() {
+        let req = SceKernelAioRWRequest {
+            offset: at as off_t,
+            nbyte,
+            buf: buf.cast(),
+            result: &mut results[i],
+            fd,
+        };
+        let mut children = [0u32; SPLIT_MAX_CHILDREN];
+        let rest = plan.len() - i - 1;
+        match unsafe {
+            prepare_virtual_request_locked(
+                state,
+                req,
+                fd_index,
+                SCE_KERNEL_AIO_PRIORITY_HIGH,
+                rest + SPLIT_MIN_FREE_SLOTS,
+                &mut children,
+            )
+        } {
+            Ok((group, _)) => {
+                jobs[i] = (children[0], group);
+                // Its completion wakes this thread on AIO_CV, not the reactor.
+                unsafe {
+                    for_each_job_locked(state, jobs[i], |j| {
+                        (*state).virtual_aio[j as usize].sync_read = true
+                    })
+                };
+            }
+            Err(e) => {
+                rc = e;
+                break;
+            }
+        }
+        prepared += 1;
+    }
+    if rc == 0 && !unsafe { ensure_workers_locked(state) } {
+        rc = SCE_KERNEL_ERROR_ENOMEM;
+    }
+    if rc != 0 {
+        for &job in &jobs[..prepared] {
+            unsafe { free_job_locked(state, job) };
+        }
+    }
+    rc
+}
+
+/// Under PACK_M: runs `f` on each job slot of a sync request (its slot, or
+/// every child of its split group) and returns how many.
+unsafe fn for_each_job_locked(
+    state: *mut PackState,
+    (index, group): (u32, u32),
+    mut f: impl FnMut(u32),
+) -> usize {
+    if group == INVALID_INDEX {
+        f(index);
+        return 1;
+    }
+    let slot = unsafe { &(*state).virtual_aio_groups[group as usize] };
+    let mut walked = 0;
+    for &id in &slot.children[..slot.child_count as usize] {
+        let mut child = INVALID_INDEX;
+        if unsafe { decode_virtual_aio(id, &mut child, null_mut()) } {
+            f(child);
+            walked += 1;
+        }
+    }
+    walked
+}
+
+/// Under PACK_M: frees a sync request's job slots and its split group.
+unsafe fn free_job_locked(state: *mut PackState, job: (u32, u32)) {
+    unsafe { for_each_job_locked(state, job, |i| free_virtual_aio_locked(state, i)) };
+    if job.1 != INVALID_INDEX {
+        unsafe { free_virtual_aio_group_locked(state, job.1) };
+    }
+}
+
+/// Sleeps on AIO_CV until every job of `jobs` is Done, then frees them. A
+/// job completes under PACK_M (worker.rs `complete_virtual_job`: result,
+/// phase, then the last split child's caller result), and shutdown aborts
+/// queued and reserved jobs and requeues parked ones (`cancel_virtual_jobs`),
+/// so the wait ends; returning before would leave workers writing into the
+/// caller's `results`. AIO_CV is shared, so every waiting reader wakes on
+/// each completion and rescans its jobs; few threads read this way (490
+/// packed POSIX reads in 2.4 min on a zstd title, 45 on a pkg title, debug
+/// `posix_reads`), so a per-reader condvar waits for a title where it shows.
+unsafe fn wait_sync(jobs: &[(u32, u32)]) {
+    let state = unsafe { pack_state() };
+    let mut g = PACK_M.lock();
+    loop {
+        let mut pending = 0usize;
+        for &job in jobs {
+            unsafe {
+                for_each_job_locked(state, job, |i| {
+                    pending +=
+                        ((*state).virtual_aio[i as usize].phase != VirtualAioPhase::Done) as usize
+                })
+            };
+        }
+        if pending == 0 {
+            break;
+        }
+        AIO_CV.wait(&mut g);
+    }
+    for &job in jobs {
+        unsafe { free_job_locked(state, job) };
+    }
 }
 
 /// Stack left to the calling thread: its stack pointer minus the lowest
@@ -359,566 +534,37 @@ fn stack_left() -> Option<usize> {
     (ok && sp > base as usize && sp - (base as usize) <= size).then(|| sp - base as usize)
 }
 
-fn note_inline_read() {
-    if !cfg!(feature = "mem_report") {
+/// Callers with less stack left than this count in `read_inline_low_stack`:
+/// 4x the 4 KiB the sync read's frames are pinned to (read_on_workers down
+/// to the queue push, tools/check_stack_frames.py `READ_CHAIN_BUDGET`).
+const LOW_STACK: usize = 16 * 1024;
+/// One read in this many asks libkernel for the caller's stack (five symbol
+/// lookups and an attribute copy), off the timed span, so the debug build's
+/// read latency stays comparable.
+const STACK_SAMPLE: u32 = 16;
+static STACK_SAMPLES: AtomicU32 = AtomicU32::new(0);
+static STACK_LEFT_MIN: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Debug: the least stack a packed reader had left (`read_inline_stack_left`)
+/// and the callers under LOW_STACK, sampled.
+fn note_caller_stack() {
+    if !cfg!(feature = "mem_report")
+        || !STACK_SAMPLES
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(STACK_SAMPLE)
+    {
         return;
     }
-    stats::add(stats::Stat::ReadInline, 1);
-    let left = stack_left().unwrap_or(0);
-    stats::set(stats::Stat::ReadInlineStackLeft, left as u64);
-    if left != 0 && left < 48 * 1024 {
+    let Some(left) = stack_left() else {
+        return;
+    };
+    let min = STACK_LEFT_MIN
+        .fetch_min(left as u64, Ordering::Relaxed)
+        .min(left as u64);
+    stats::set(stats::Stat::ReadInlineStackLeft, min);
+    if left < LOW_STACK {
         stats::add(stats::Stat::ReadInlineLowStack, 1);
     }
-}
-
-/// `read_on_workers` runs here, not on the caller's thread: its frames hold
-/// AIO arrays sized for 128 requests (read_on_workers 12,024 B,
-/// sceKernelAioSubmitReadCommandsMultiple 13,528 B, publish_virtual_jobs
-/// 6,600 B in the debug PRX), ~32 KB that a small game thread does not have.
-/// A game's video I/O thread read a packed file and faulted on the guard
-/// page in publish_virtual_jobs. The thread stacks (at most READ_THREADS x
-/// READ_STACK = 4 x 128 KiB = 512 KiB) are libkernel memory, outside the
-/// internal pool. Every virtual-fd read pays one handoff; smaller AIO
-/// arrays (smaller batches, more submits) would let the caller's thread
-/// read inline, if the handoff shows in read latency.
-const READ_THREADS: usize = 4;
-/// 128 KiB: read_on_workers needs ~32 KB (above). The stacks come from the
-/// game's flexible memory, which a title can use up (flex_free_bytes 0 of
-/// 312 MiB, debug /metrics).
-const READ_STACK: usize = 128 * 1024;
-const READ_QUEUE: usize = 64;
-
-/// One read handed to a read thread; lives on the waiting caller's stack.
-struct ReadCall {
-    fd: c_int,
-    vector: *const SceKernelIovec,
-    count: usize,
-    offset: u64,
-    length: u64,
-    rc: ssize_t,
-    done: bool,
-    /// Index into READ_DONE_CVS of the condvar its caller waits on.
-    cv: usize,
-}
-
-/// FIFO of `N` queued items: read threads take the oldest call, so a queued
-/// read cannot starve behind later ones (a first-free-slot scan took the
-/// lowest slot, which later calls could refill every time). `head` and
-/// `tail` count pops and pushes; the slot is the count mod `N`.
-struct Fifo<T: Copy, const N: usize> {
-    slots: [Option<T>; N],
-    head: usize,
-    tail: usize,
-}
-
-impl<T: Copy, const N: usize> Fifo<T, N> {
-    const fn new() -> Self {
-        Self {
-            slots: [None; N],
-            head: 0,
-            tail: 0,
-        }
-    }
-    /// Appends `item`; false (and nothing changes) when `N` are queued.
-    fn push(&mut self, item: T) -> bool {
-        if self.tail.wrapping_sub(self.head) == N {
-            return false;
-        }
-        self.slots[self.tail % N] = Some(item);
-        self.tail = self.tail.wrapping_add(1);
-        true
-    }
-    /// Removes and returns the oldest item.
-    fn pop(&mut self) -> Option<T> {
-        if self.head == self.tail {
-            return None;
-        }
-        let item = self.slots[self.head % N].take();
-        self.head = self.head.wrapping_add(1);
-        item
-    }
-}
-
-static READ_M: Mutex = Mutex::new();
-/// Read threads wait here for a call, an exit request or shutdown. Callers
-/// waiting for queue space have their own condvar, so neither side wakes
-/// the other (one shared condvar woke both on every push and pop).
-static READ_WORK_CV: Condvar = Condvar::new();
-/// Callers wait here while READ_QUEUE calls are queued.
-static READ_SPACE_CV: Condvar = Condvar::new();
-/// Callers waiting on READ_SPACE_CV, under READ_M: a pop signals only then.
-static READ_SPACE_WAITERS: SyncCell<u32> = SyncCell::new(0);
-/// Condvars callers wait on for their call to finish, handed out round
-/// robin (READ_DONE_NEXT). One shared condvar with notify_all woke every
-/// waiting caller per finished read, up to READ_QUEUE + READ_THREADS = 68,
-/// and all but one slept again. Two callers share one only while a call
-/// waits through 64 newer ones; the notify_all on it covers that case.
-/// Each pthread cond is created on first use, then kept (64 in all).
-const READ_DONE_CV_COUNT: usize = 64;
-static READ_DONE_CVS: [Condvar; READ_DONE_CV_COUNT] = {
-    const CV: Condvar = Condvar::new();
-    [CV; READ_DONE_CV_COUNT]
-};
-static READ_DONE_NEXT: AtomicU32 = AtomicU32::new(0);
-/// Calls queued for the read threads, oldest first, under READ_M.
-static READ_CALLS: SyncCell<Fifo<*mut ReadCall, READ_QUEUE>> = SyncCell::new(Fifo::new());
-/// Small calls (at most READ_FAST_MAX_BYTES), taken before READ_CALLS: an
-/// audio or video stream's 16-64 KiB read no longer waits behind several
-/// multi-MiB asset reads for one of the READ_THREADS. Under READ_M.
-static READ_FAST_CALLS: SyncCell<Fifo<*mut ReadCall, READ_QUEUE>> = SyncCell::new(Fifo::new());
-/// The small-call bound: the pack's latency class (schedule.rs).
-const READ_FAST_MAX_BYTES: u64 = AMPR_EMU_PACK_LATENCY_READ_MAX_BYTES;
-/// Small calls popped in a row while large ones waited; at READ_FAST_BURST
-/// the oldest large call goes first, so large reads are never starved.
-/// Under READ_M.
-static READ_FAST_STREAK: SyncCell<u32> = SyncCell::new(0);
-const READ_FAST_BURST: u32 = 8;
-
-/// Under READ_M: queues `call` in the FIFO its size picks; false when full.
-unsafe fn read_queue_push(call: *mut ReadCall) -> bool {
-    unsafe {
-        if (*call).length <= READ_FAST_MAX_BYTES {
-            (*READ_FAST_CALLS.get()).push(call)
-        } else {
-            (*READ_CALLS.get()).push(call)
-        }
-    }
-}
-
-/// Under READ_M: the next call, small ones first (see READ_FAST_STREAK).
-unsafe fn read_queue_pop() -> Option<*mut ReadCall> {
-    unsafe {
-        pop_prioritized(
-            &mut *READ_FAST_CALLS.get(),
-            &mut *READ_CALLS.get(),
-            &mut *READ_FAST_STREAK.get(),
-        )
-    }
-}
-
-/// `fast` first, but after READ_FAST_BURST fast pops in a row while `slow`
-/// had items, one from `slow`.
-fn pop_prioritized<T: Copy, const N: usize>(
-    fast: &mut Fifo<T, N>,
-    slow: &mut Fifo<T, N>,
-    streak: &mut u32,
-) -> Option<T> {
-    if *streak < READ_FAST_BURST {
-        if let Some(item) = fast.pop() {
-            if slow.head != slow.tail {
-                *streak += 1;
-            }
-            return Some(item);
-        }
-    }
-    *streak = 0;
-    slow.pop().or_else(|| fast.pop())
-}
-/// Length of READ_CALLS, changed under READ_M; a spinning read thread polls
-/// it without the lock.
-static READ_QUEUED: AtomicU32 = AtomicU32::new(0);
-/// A failed first read thread start is tried again from this time (ns,
-/// monotonic) on; reads run inline meanwhile. One try per 100 ms keeps a
-/// game out of thread creation on every read while it has no room.
-static READ_START_RETRY_NS: AtomicU64 = AtomicU64::new(0);
-const READ_START_RETRY_GAP_NS: u64 = 100_000_000;
-static READ_THREADS_UP: AtomicU32 = AtomicU32::new(0);
-/// Set under READ_M by `stop_read_threads`; a read thread exits once it sees
-/// it with an empty queue.
-static READ_STOP: AtomicBool = AtomicBool::new(false);
-/// Started read threads, joined by `stop_read_threads` before module_stop
-/// returns, so none is left in the PRX's code after an unload.
-static READ_HANDLES: SyncCell<[ScePthread; READ_THREADS]> =
-    SyncCell::new([null_mut(); READ_THREADS]);
-
-// ---- read thread count ----
-// One read thread at first; another starts when a call is queued and none
-// waits, up to READ_THREADS and the thread budget (rt/thread_hooks.rs). A
-// thread that finishes a call leaves when more are live than the load target
-// (thread_hooks::LoadGroup), never the last in normal mode. Under pressure,
-// or when a game short of threads asks (`read_threads_ask`), they leave
-// down to one while calls are queued and to none without; the next call
-// starts one again, which pressure mode then keeps, or reads inline when it
-// cannot.
-
-/// Busy read thread samples and the load target (rt/thread_hooks.rs).
-static READ_LOAD: super::super::thread_hooks::LoadGroup =
-    super::super::thread_hooks::LoadGroup::new(0);
-const READ_SLOT_EMPTY: u8 = 0;
-const READ_SLOT_LIVE: u8 = 1;
-const READ_SLOT_EXITED: u8 = 2;
-/// Per slot state, idle threads and exits asked, all under READ_M.
-static READ_SLOTS: SyncCell<[u8; READ_THREADS]> = SyncCell::new([READ_SLOT_EMPTY; READ_THREADS]);
-static READ_IDLE: AtomicU32 = AtomicU32::new(0);
-static READ_EXIT_REQUESTS: AtomicU32 = AtomicU32::new(0);
-/// A read thread left: the next read thread through READ_M joins it (a
-/// spawn and `read_threads_reap` join too), so its slot is free at once (as
-/// WORKER_REAP_PENDING, worker.rs).
-static READ_REAP_PENDING: AtomicBool = AtomicBool::new(false);
-
-// ---- spin before park ----
-// With tune::spin_us() > 0, a read thread that finished a call polls
-// READ_QUEUED for that long before it parks, so a read that follows soon
-// skips a condvar sleep and wake. At most one thread spins. READ_SPIN
-// changes only under READ_M: a caller that queues a call while it is
-// SPIN_WAITING claims the spinner (SPIN_CLAIMED) instead of signalling. The
-// spinner clears it under READ_M and pops in the same hold, so a claimed
-// call is never left without a thread to take it.
-const SPIN_NONE: u8 = 0;
-const SPIN_WAITING: u8 = 1;
-const SPIN_CLAIMED: u8 = 2;
-static READ_SPIN: AtomicU8 = AtomicU8::new(SPIN_NONE);
-
-/// Polls READ_QUEUED for up to `us` with the lock released; the clock is
-/// read every 32 pauses, not on each.
-fn spin_for_call(us: u32) {
-    let start = super::super::sys::monotonic_ns();
-    let limit = us as u64 * 1000;
-    let mut n = 0u32;
-    while READ_QUEUED.load(Ordering::Acquire) == 0 && !READ_STOP.load(Ordering::Relaxed) {
-        core::hint::spin_loop();
-        n = n.wrapping_add(1);
-        if n % 32 == 0 {
-            let now = super::super::sys::monotonic_ns();
-            if start == 0 || now == 0 || now.saturating_sub(start) >= limit {
-                return;
-            }
-        }
-    }
-}
-
-unsafe extern "C" fn read_thread(arg: *mut c_void) -> *mut c_void {
-    let slot = arg as usize;
-    // Reactor priority and the workers' cores, as the pread pool: the thread
-    // is nearly always blocked, handing a call to a worker and waiting. With
-    // default attributes it ran at 700, below the game's threads (404, 552),
-    // and a zstd title blocked in read() stopped loading with the runtime idle.
-    unsafe {
-        let _ = scePthreadSetprio(
-            scePthreadSelf(),
-            crate::rt::reactor::AMPR_EMU_APR_REACTOR_THREAD_PRIORITY,
-        );
-        if AMPR_EMU_PACK_WORKER_AFFINITY != 0 {
-            let _ = scePthreadSetaffinity(scePthreadSelf(), AMPR_EMU_PACK_WORKER_AFFINITY);
-        }
-    }
-    // Under READ_M: this thread leaves the live set.
-    let leave = || {
-        READ_THREADS_UP.fetch_sub(1, Ordering::Release);
-        unsafe { (*READ_SLOTS.get())[slot] = READ_SLOT_EXITED };
-        READ_REAP_PENDING.store(true, Ordering::Release);
-        // Yield, load retirement, shutdown: every idle thread rechecks, so a
-        // call queued for this one is taken.
-        READ_WORK_CV.notify_all();
-    };
-    let mut g = READ_M.lock();
-    loop {
-        let call = {
-            loop {
-                if READ_REAP_PENDING.swap(false, Ordering::AcqRel) {
-                    unsafe { reap_read_threads_locked() };
-                }
-                // The last thread leaves only with no call queued.
-                let others = READ_THREADS_UP.load(Ordering::Relaxed) > 1
-                    || READ_QUEUED.load(Ordering::Relaxed) == 0;
-                if others && READ_EXIT_REQUESTS.load(Ordering::Relaxed) != 0 {
-                    READ_EXIT_REQUESTS.fetch_sub(1, Ordering::Relaxed);
-                    leave();
-                    return null_mut();
-                }
-                if let Some(call) = unsafe { read_queue_pop() } {
-                    READ_QUEUED.fetch_sub(1, Ordering::Release);
-                    // One slot freed: one caller waiting on a full queue
-                    // can push.
-                    if unsafe { *READ_SPACE_WAITERS.get() } != 0 {
-                        READ_SPACE_CV.notify_one();
-                    }
-                    READ_LOAD.begin();
-                    break call;
-                }
-                if READ_STOP.load(Ordering::Acquire) {
-                    leave();
-                    return null_mut();
-                }
-                READ_IDLE.fetch_add(1, Ordering::Relaxed);
-                READ_WORK_CV.wait(&mut g);
-                READ_IDLE.fetch_sub(1, Ordering::Relaxed);
-            }
-        };
-        drop(g);
-        let rc = unsafe {
-            let c = &*call;
-            read_on_workers(
-                c.fd,
-                core::slice::from_raw_parts(c.vector, c.count),
-                c.offset,
-                c.length,
-            )
-        };
-        g = READ_M.lock();
-        READ_LOAD.end();
-        // Under READ_M: the caller cannot see `done` and leave (freeing
-        // `call`) before this thread unlocks, after the notify.
-        let cv = unsafe { (*call).cv };
-        unsafe { ((*call).rc, (*call).done) = (rc, true) };
-        READ_DONE_CVS[cv].notify_all();
-        // Above the load target: leave (`leave` wakes the others for any
-        // queued call; under pressure one stays while calls are queued),
-        // meeting an exit asked of the group if any.
-        if READ_LOAD.retire_due(
-            READ_THREADS_UP.load(Ordering::Relaxed),
-            READ_THREADS as u32,
-            READ_QUEUED.load(Ordering::Relaxed) != 0,
-        ) {
-            let _ = super::super::thread_hooks::take_exit_request(&READ_EXIT_REQUESTS);
-            leave();
-            return null_mut();
-        }
-        let spin = super::super::tune::spin_us();
-        if spin != 0
-            && READ_QUEUED.load(Ordering::Relaxed) == 0
-            && READ_SPIN.load(Ordering::Relaxed) == SPIN_NONE
-        {
-            READ_SPIN.store(SPIN_WAITING, Ordering::Relaxed);
-            drop(g);
-            spin_for_call(spin);
-            g = READ_M.lock();
-            // Cleared and followed by a pop in this hold (see READ_SPIN).
-            READ_SPIN.store(SPIN_NONE, Ordering::Relaxed);
-        }
-    }
-}
-
-/// Under READ_M: joins threads that left (they hold no lock any more) and
-/// frees their slots.
-unsafe fn reap_read_threads_locked() {
-    // `stop_read_threads` joins every thread itself; READ_STOP is set under
-    // READ_M, so no reap is in progress after it.
-    if READ_STOP.load(Ordering::Acquire) {
-        return;
-    }
-    let slots = unsafe { &mut *READ_SLOTS.get() };
-    let handles = unsafe { &mut *READ_HANDLES.get() };
-    for i in 0..READ_THREADS {
-        if slots[i] == READ_SLOT_EXITED {
-            let _ = unsafe { scePthreadJoin(handles[i], null_mut()) };
-            handles[i] = null_mut();
-            slots[i] = READ_SLOT_EMPTY;
-        }
-    }
-}
-
-/// Under READ_M: starts one read thread with a READ_STACK stack in a free
-/// slot; false when all are taken or the creation failed.
-unsafe fn spawn_read_thread_locked() -> bool {
-    unsafe { reap_read_threads_locked() };
-    let slots = unsafe { &mut *READ_SLOTS.get() };
-    let Some(slot) = slots.iter().position(|&s| s == READ_SLOT_EMPTY) else {
-        return false;
-    };
-    // The runtime-wide thread budget (rt/thread_hooks.rs).
-    if !super::super::thread_hooks::reserve(READ_THREADS_UP.load(Ordering::Relaxed) == 0) {
-        return false;
-    }
-    let mut thread: ScePthread = null_mut();
-    let rc = unsafe {
-        super::super::thread_hooks::create_counted(
-            (&mut thread as *mut ScePthread).cast(),
-            read_thread,
-            slot as *mut c_void,
-            c"ampr_fd_read".as_ptr(),
-            READ_STACK,
-        )
-    };
-    if rc != 0 {
-        return false;
-    }
-    unsafe { (*READ_HANDLES.get())[slot] = thread };
-    slots[slot] = READ_SLOT_LIVE;
-    READ_LOAD.started(READ_THREADS_UP.fetch_add(1, Ordering::Release) + 1);
-    true
-}
-
-/// Starts the first read thread; false when none is running. A failed start
-/// (no thread budget, or the game used up its threads) is tried again on a
-/// later read, at most once per READ_START_RETRY_GAP_NS; a once flag never
-/// retried, so every read stayed inline for the rest of the run. No read
-/// thread starts after `stop_read_threads`.
-unsafe fn start_read_threads() -> bool {
-    if READ_THREADS_UP.load(Ordering::Acquire) != 0 {
-        return true;
-    }
-    if READ_STOP.load(Ordering::Acquire) {
-        return false;
-    }
-    let now = super::super::sys::monotonic_ns();
-    if now < READ_START_RETRY_NS.load(Ordering::Relaxed) {
-        return false;
-    }
-    let _g = READ_M.lock();
-    if READ_THREADS_UP.load(Ordering::Relaxed) == 0
-        && !READ_STOP.load(Ordering::Acquire)
-        && !unsafe { spawn_read_thread_locked() }
-    {
-        READ_START_RETRY_NS.store(
-            now.saturating_add(READ_START_RETRY_GAP_NS),
-            Ordering::Relaxed,
-        );
-    }
-    READ_THREADS_UP.load(Ordering::Relaxed) != 0
-}
-
-/// Read thread exits asked (`read_threads_ask`) not yet done; none after
-/// `stop_read_threads`, which joins every thread without meeting them.
-pub(crate) fn read_threads_pending_exits() -> u32 {
-    if READ_STOP.load(Ordering::Acquire) {
-        return 0;
-    }
-    READ_EXIT_REQUESTS.load(Ordering::Relaxed)
-}
-
-/// Live read threads (make_room counts what a yield gave from it).
-pub(crate) fn read_threads_live() -> u32 {
-    READ_THREADS_UP.load(Ordering::Acquire)
-}
-
-/// Asks up to `want` read threads to leave (the last only with no call
-/// queued) and wakes them. Returns how many it asked. Called from a game
-/// thread whose creation failed (rt/thread_hooks.rs `make_room`), which
-/// then waits and calls `read_threads_reap`.
-pub(crate) unsafe fn read_threads_ask(want: u32) -> u32 {
-    let _g = READ_M.lock();
-    READ_LOAD.asked();
-    // Exits other yields already asked for are not given twice.
-    let give = super::super::thread_hooks::exits_to_ask(
-        want,
-        READ_THREADS_UP.load(Ordering::Relaxed),
-        (READ_QUEUED.load(Ordering::Relaxed) != 0) as u32,
-        READ_EXIT_REQUESTS.load(Ordering::Relaxed),
-    );
-    if give != 0 {
-        READ_EXIT_REQUESTS.fetch_add(give, Ordering::Relaxed);
-        READ_WORK_CV.notify_all();
-    }
-    give
-}
-
-/// Joins the read threads that left since `before` were live and counts
-/// them.
-pub(crate) unsafe fn read_threads_reap(before: u32) -> u32 {
-    let _g = READ_M.lock();
-    unsafe { reap_read_threads_locked() };
-    let released = before.saturating_sub(READ_THREADS_UP.load(Ordering::Relaxed));
-    READ_LOAD.yielded(released);
-    released
-}
-
-/// Debug /metrics: live read threads and the group's load counters.
-#[cfg(feature = "mem_report")]
-pub(crate) fn read_threads_load() -> (u32, [u64; 5]) {
-    let _g = READ_M.lock();
-    (READ_THREADS_UP.load(Ordering::Relaxed), READ_LOAD.metrics())
-}
-
-/// `read_on_workers` on a read thread; inline when no read thread started.
-/// Shutdown, after pack submissions drained (each virtual read holds one
-/// while it waits for its read thread, so the queue is empty): wakes the
-/// read threads and joins them; a read after this runs inline
-/// (`start_read_threads` checks READ_STOP).
-unsafe fn stop_read_threads() {
-    // No early return on READ_THREADS_UP == 0: threads that left but were
-    // not reaped still hold handles to join here.
-    {
-        let _g = READ_M.lock();
-        READ_STOP.store(true, Ordering::Release);
-        READ_WORK_CV.notify_all();
-        READ_SPACE_CV.notify_all();
-    }
-    for thread in unsafe { (*READ_HANDLES.get()).iter_mut() } {
-        if !thread.is_null() {
-            let _ = unsafe { scePthreadJoin(*thread, null_mut()) };
-            *thread = null_mut();
-        }
-    }
-    unsafe { *READ_SLOTS.get() = [READ_SLOT_EMPTY; READ_THREADS] };
-    READ_THREADS_UP.store(0, Ordering::Release);
-}
-
-unsafe fn read_on_read_thread(
-    fd: c_int,
-    vector: &[SceKernelIovec],
-    offset: u64,
-    length: u64,
-) -> ssize_t {
-    // No read thread (its first creation failed and the retry is not due,
-    // or after shutdown): read inline. An error instead would fail every packed read,
-    // also on the large-stack threads that read fine inline; only a
-    // small-stack caller is at risk, as before the read threads existed.
-    if !unsafe { start_read_threads() } {
-        return unsafe { read_inline(fd, vector, offset, length) };
-    }
-    let mut call = ReadCall {
-        fd,
-        vector: vector.as_ptr(),
-        count: vector.len(),
-        offset,
-        length,
-        rc: 0,
-        done: false,
-        cv: READ_DONE_NEXT.fetch_add(1, Ordering::Relaxed) as usize % READ_DONE_CV_COUNT,
-    };
-    let p: *mut ReadCall = &mut call;
-    let mut g = READ_M.lock();
-    loop {
-        // Every thread may have left since start_read_threads looked, or
-        // while this call waited for space (load or pressure); a call
-        // queued with none live and none startable would wait forever, so
-        // it reads inline then (after shutdown, and within
-        // READ_START_RETRY_GAP_NS of a failed start, without trying).
-        if READ_THREADS_UP.load(Ordering::Relaxed) == 0 {
-            let now = super::super::sys::monotonic_ns();
-            let due = !READ_STOP.load(Ordering::Acquire)
-                && now >= READ_START_RETRY_NS.load(Ordering::Relaxed);
-            if !(due && unsafe { spawn_read_thread_locked() }) {
-                if due {
-                    READ_START_RETRY_NS.store(
-                        now.saturating_add(READ_START_RETRY_GAP_NS),
-                        Ordering::Relaxed,
-                    );
-                }
-                drop(g);
-                return unsafe { read_inline(fd, vector, offset, length) };
-            }
-        }
-        if unsafe { read_queue_push(p) } {
-            READ_QUEUED.fetch_add(1, Ordering::Release);
-            break;
-        }
-        // Full: READ_QUEUE calls wait for a read thread.
-        unsafe { *READ_SPACE_WAITERS.get() += 1 };
-        READ_SPACE_CV.wait(&mut g);
-        unsafe { *READ_SPACE_WAITERS.get() -= 1 };
-    }
-    if READ_SPIN.load(Ordering::Relaxed) == SPIN_WAITING {
-        // The spinner takes it (see READ_SPIN): no signal, no new thread.
-        READ_SPIN.store(SPIN_CLAIMED, Ordering::Relaxed);
-    } else {
-        // No thread waits for it: one more, up to READ_THREADS.
-        let up = READ_THREADS_UP.load(Ordering::Relaxed);
-        if READ_IDLE.load(Ordering::Relaxed) == 0
-            && up < READ_THREADS as u32
-            && READ_LOAD.may_grow(up)
-        {
-            let _ = unsafe { spawn_read_thread_locked() };
-        }
-        // One call queued: one idle thread can take it. A woken thread that
-        // leaves instead (exit request) wakes all of them (`leave`).
-        READ_WORK_CV.notify_one();
-    }
-    // `done` is written under READ_M by the read thread.
-    READ_DONE_CVS[call.cv].wait_until(&mut g, || unsafe { core::ptr::read_volatile(&(*p).done) });
-    drop(g);
-    call.rc
 }
 
 /// Logical size of the packed file behind a virtual fd slot.
@@ -935,6 +581,30 @@ unsafe fn virtual_fd_snapshot(
     let _lock = PACK_M.lock();
     let slot = (*state).virtual_fds[index as usize];
     slot.holds(fd).then_some(slot)
+}
+
+/// Admits one submission (PackSubmission) and snapshots slot `index` while
+/// it still holds `fd`, in one PACK_M section: a sync pread took PACK_M five
+/// times (admission, snapshot, submit, wait, release), now four. None when
+/// shutdown closed submissions or the fd closed (EBADF either way).
+unsafe fn admit_fd_snapshot(
+    state: *mut PackState,
+    fd: c_int,
+    index: u32,
+) -> Option<(PackSubmission, VirtualFdSlot)> {
+    let _lock = PACK_M.lock();
+    let slot = (*state).virtual_fds[index as usize];
+    if (*state).submissions_closed || !slot.holds(fd) {
+        return None;
+    }
+    (*state).active_submissions += 1;
+    Some((
+        PackSubmission {
+            state,
+            admitted: true,
+        },
+        slot,
+    ))
 }
 
 /// Classifies `fd` for a read: Some(slot) for a virtual pack fd; None with
@@ -982,111 +652,20 @@ unsafe fn read_slot_at(
         Ok(n) => n,
         Err(e) => return e as ssize_t,
     };
-    if let Some(n) = unsafe { read_cached_inline(state, slot.file_id, vector, offset as u64, length) } {
-        return n;
-    }
-    unsafe { read_on_read_thread(fd, vector, offset as u64, length) }
-}
-
-/// Most chunks the inline path pins for one read: 8 x 256 KiB chunks, 2 MiB.
-const INLINE_READ_MAX_TASKS: usize = 8;
-
-/// A read whose chunks are all decoded already, copied on the caller's
-/// thread: no read thread handoff, no AIO submit, no worker wake. Only a
-/// single-segment read (read/pread; readv goes the usual way) of at most
-/// INLINE_READ_MAX_TASKS chunks, all Ready in the decoded cache; anything
-/// else returns None and takes the worker path, which loads and decodes.
-/// The frame stays small (the pins below, ~200 B), so a small-stack game
-/// thread can run it, unlike `read_on_workers`. The caller's
-/// PackSubmission keeps the cache alive; the pins keep each entry.
-unsafe fn read_cached_inline(
-    state: *const PackState,
-    file_id: u32,
-    vector: &[SceKernelIovec],
-    offset: u64,
-    length: u64,
-) -> Option<ssize_t> {
-    let [segment] = vector else { return None };
-    if segment.iov_base.is_null() || (segment.iov_len as u64) < length {
-        return None;
-    }
-    let state_mut = state as *mut PackState;
-    if unsafe { (*state).cache_base.is_null() || (*state).cache_page_count == 0 } {
-        return None;
-    }
-    let (file, _size, flags) = unsafe { packed_read_file(state, file_id) }?;
-    // Never admitted (caches.rs), so never a hit.
-    if flags & AMPR_PACK_FILE_STREAMING != 0 {
-        return None;
-    }
-    let count = unsafe { ampr_pack_core_task_count(file.ptr(), offset, length) };
-    if count == 0 || count > INLINE_READ_MAX_TASKS {
-        return None;
-    }
-    let chunk_count = unsafe { pack_chunk_count(state) };
-    let mut tasks = [AmprPackBlockReadTask::default(); INLINE_READ_MAX_TASKS];
-    let mut covered = 0u64;
-    for (i, task) in tasks[..count].iter_mut().enumerate() {
-        if unsafe {
-            ampr_pack_core_make_task(&(*state).core_view, file.ptr(), offset, length, i, task)
-        } != AMPR_PACK_CORE_OK
-            || task.chunk_index as u64 >= chunk_count
-            || task.chunk.flags & AMPR_PACK_CHUNK_STREAMING != 0
-            || task.destination_offset as u64 + task.copy_length as u64 > length
-            || task.source_offset as u64 + task.copy_length as u64 > task.chunk.raw_size as u64
-        {
-            return None;
-        }
-        covered += task.copy_length as u64;
-    }
-    if covered != length {
-        return None;
-    }
-    // Pin every chunk or none: one lock hold, Ready entries only (a Loading
-    // or missing chunk is the workers' job).
-    let mut leases = [CacheLease::EMPTY; INLINE_READ_MAX_TASKS];
-    {
-        let _lock = CACHE_MUTEX.lock();
-        for (task, lease) in tasks[..count].iter().zip(leases.iter_mut()) {
-            let found = unsafe { cache_find_locked(state_mut, &task.chunk, chunk_key_hash(&task.chunk)) };
-            if found == INVALID_INDEX {
-                break;
-            }
-            let entry = unsafe { &mut (*state_mut).cache_entries[found as usize] };
-            if entry.state != CacheEntryState::Ready {
-                break;
-            }
-            entry.pin_count += 1;
-            entry.referenced = true;
-            lease.entry = found;
-            lease.data = unsafe {
-                (*state)
-                    .cache_base
-                    .add(entry.page_start as usize * PACK_CACHE_PAGE_BYTES)
-            };
-        }
-    }
-    let all = leases[..count].iter().all(|l| l.entry != INVALID_INDEX);
-    if all {
-        let out = segment.iov_base as *mut u8;
-        for (task, lease) in tasks[..count].iter().zip(leases.iter()) {
-            let start = stats::now();
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    lease.data.add(task.source_offset as usize),
-                    out.add(task.destination_offset as usize),
-                    task.copy_length as usize,
-                )
-            };
-            stats::add(stats::Stat::CopyNs, stats::since(start));
-            stats::add(stats::Stat::CopyBytes, task.copy_length as u64);
-        }
-        stats::add(stats::Stat::CacheHits, count as u64);
-    }
-    for lease in leases[..count].iter_mut() {
-        unsafe { cache_release(lease) };
-    }
-    all.then_some(length as ssize_t)
+    note_caller_stack();
+    // Debug: the read's latency as its caller sees it, the queue wait, the
+    // pack job and the wake-up included (posix_read_ns, rt/stats.rs).
+    let start = stats::now();
+    let cancel = no_cancel();
+    let rc = unsafe { read_on_workers(fd, vector, offset as u64, length) };
+    restore_cancel(cancel);
+    stats::span(
+        start,
+        stats::Stat::PosixReads,
+        stats::Stat::PosixReadNs,
+        stats::Stat::PosixReadNsMax,
+    );
+    rc
 }
 
 /// pread/preadv: the slot cursor is neither read nor moved, so concurrent
@@ -1104,11 +683,7 @@ unsafe fn virtual_pread(
         return rc;
     };
     let state = unsafe { pack_state() };
-    let submission = PackSubmission::new(state);
-    if !submission.admitted() {
-        return SCE_KERNEL_ERROR_EBADF as ssize_t;
-    }
-    let Some(slot) = (unsafe { virtual_fd_snapshot(state, fd, index) }) else {
+    let Some((_submission, slot)) = (unsafe { admit_fd_snapshot(state, fd, index) }) else {
         return SCE_KERNEL_ERROR_EBADF as ssize_t;
     };
     unsafe { read_slot_at(state, fd, &slot, iov, iovcnt, offset) }
@@ -1135,13 +710,9 @@ unsafe fn virtual_read(
     if WORKER_STOP_REQUESTED.load(Ordering::Acquire) {
         return SCE_KERNEL_ERROR_EBADF as ssize_t;
     }
-    let submission = PackSubmission::new(state);
-    if !submission.admitted() {
-        return SCE_KERNEL_ERROR_EBADF as ssize_t;
-    }
     // Close needs the descriptor mutex, so this slot stays this fd's until
     // the guard drops; re-check in case it closed before we took it.
-    let Some(slot) = (unsafe { virtual_fd_snapshot(state, fd, index) }) else {
+    let Some((_submission, slot)) = (unsafe { admit_fd_snapshot(state, fd, index) }) else {
         return SCE_KERNEL_ERROR_EBADF as ssize_t;
     };
     let cursor = slot.cursor;
@@ -1439,8 +1010,8 @@ pub unsafe fn ampr_pack_is_virtual_fd(fd: c_int) -> bool {
 }
 
 /// One-based AMPRIDX3 file id behind an open virtual pack fd; None for any
-/// other fd. rt/pack/mmap.rs keys its disk cache by it; debug probes
-/// (rt/probe.rs) map it to the file's path.
+/// other fd. The save icon read (rt/save.rs) tests a packed open with it;
+/// debug probes (rt/probe.rs) map it to the file's path.
 pub(crate) unsafe fn virtual_fd_file_id(fd: c_int) -> Option<u32> {
     let slot = decode_virtual_fd(fd)?;
     let state = unsafe { pack_state() };
@@ -1479,6 +1050,21 @@ pub(crate) unsafe extern "C" fn complete_pack_backing_aio_adapter(
 ) {
     // The pack and reactor notification layouts are identical.
     unsafe { complete_pack_backing_aio(context, notification.cast()) };
+}
+
+/// reactor::PackPreadCallback for a window read a worker queued to the pread
+/// pool itself (worker.rs `submit_pipeline_io_locked`). A pool thread holding
+/// no lock calls it, so after the job is requeued it may also start the
+/// decode worker the requeue asked for (worker.rs `grow_workers`), which the
+/// reactor thread never does.
+pub(crate) unsafe extern "C" fn complete_pack_pread(
+    context: *mut c_void,
+    notification: *const reactor::AprExternalAioNotification,
+) {
+    unsafe {
+        complete_pack_backing_aio(context, notification.cast());
+        super::worker::grow_workers();
+    }
 }
 
 const _: () = {
@@ -1535,7 +1121,7 @@ pub(crate) unsafe extern "C" fn complete_pack_backing_aio(
                 p.native_accepted = false;
                 p.native_io_error = n.value;
                 p.native_completion_ready = true;
-                queue_push_locked(state, owner, pack_telemetry_usecs());
+                queue_push_locked(state, owner);
                 queue_worker = true;
             }
             AprExternalAioEvent::Completed => {
@@ -1557,7 +1143,7 @@ pub(crate) unsafe extern "C" fn complete_pack_backing_aio(
                     SCE_KERNEL_ERROR_ECANCELED
                 };
                 p.native_completion_ready = true;
-                queue_push_locked(state, owner, 0);
+                queue_push_locked(state, owner);
                 queue_worker = true;
             }
         }
@@ -1603,8 +1189,6 @@ pub unsafe fn ampr_pack_shutdown() -> c_int {
             || unsafe { core::ptr::read_volatile(addr_of_mut!((*sp).active_submissions)) } == 0,
         );
     }
-    unsafe { stop_read_threads() };
-    unsafe { super::mmap::close_cache() };
     {
         let _g = MANIFEST_MUTEX.lock();
         WORKER_STOP_REQUESTED.store(true, Ordering::Release);
@@ -1643,6 +1227,12 @@ pub unsafe fn ampr_pack_shutdown() -> c_int {
     // A reap under PACK_M started before the stop flag finishes first; after
     // it none starts (worker.rs `reap_workers_locked`).
     drop(PACK_M.lock());
+    // A worker claimed before the stop flag may still be in creation
+    // (worker.rs grow_workers): wait for its handle; no claim starts after
+    // the flag, which every claim checks under PACK_M.
+    while super::worker::WORKER_SPAWNING.load(Ordering::Acquire) != 0 {
+        unsafe { sceKernelUsleep(100) };
+    }
     let mut join_error = 0;
     for worker in (*state).workers.iter_mut() {
         if !worker.started {
@@ -1659,7 +1249,6 @@ pub unsafe fn ampr_pack_shutdown() -> c_int {
         if (*state).workers_started != 0 {
             (*state).workers_started -= 1;
         }
-        PROFILE_STARTED_WORKERS.store((*state).workers_started, Ordering::Release);
     }
     if join_error != 0 {
         return join_error;
@@ -1717,15 +1306,12 @@ unsafe fn cancel_virtual_jobs(state: *mut PackState) {
                     SCE_KERNEL_AIO_STATE_ABORTED,
                 )
             },
-            VirtualAioPhase::WaitingCache => queue_cache_waiter_locked(state, index, 0),
-            VirtualAioPhase::WaitingFd => queue_fd_waiter_locked(state, index, 0),
+            VirtualAioPhase::WaitingCache => queue_cache_waiter_locked(state, index),
+            VirtualAioPhase::WaitingFd => queue_fd_waiter_locked(state, index),
             _ => {}
         }
     }
     QUEUE_CV.notify_all();
-    for cv in CACHE_CVS.iter() {
-        cv.notify_all();
-    }
 }
 
 /// Shutdown: resets the pack handles, virtual jobs, virtual fds and virtual
@@ -1811,6 +1397,10 @@ unsafe fn free_worker_and_cache_memory(state: *mut PackState) {
     (*state).pipeline_free_head = INVALID_INDEX;
     (*state).pipeline_capacity = 0;
     (*state).cache_waiter_count = 0;
+    // Under CACHE_MUTEX: a late index load may be carving the cache again
+    // (manifest.rs `grow_cache_from_index`); it gives up once it sees the
+    // stop flag, so the block freed here is the one that stays.
+    let _cache = CACHE_MUTEX.lock();
     if !(*state).cache_base.is_null() {
         unsafe {
             crate::rt::index_memory::cache_free(
@@ -1842,36 +1432,6 @@ mod tests {
         iov_base: core::ptr::null_mut(),
         iov_len: 0,
     };
-
-    #[test]
-    fn small_reads_go_first_without_starving_large_ones() {
-        let (mut fast, mut slow) = (Fifo::<u32, 64>::new(), Fifo::<u32, 64>::new());
-        let mut streak = 0;
-        assert!(slow.push(1000));
-        for i in 0..20 {
-            assert!(fast.push(i));
-        }
-        let order: Vec<u32> =
-            core::iter::from_fn(|| pop_prioritized(&mut fast, &mut slow, &mut streak)).collect();
-        let burst = READ_FAST_BURST as usize;
-        assert_eq!(order[..burst], (0..READ_FAST_BURST).collect::<Vec<_>>()[..]);
-        assert_eq!(order[burst], 1000);
-        assert_eq!(order.len(), 21);
-        // Only small calls queued: no streak builds up.
-        assert!(fast.push(7));
-        assert_eq!(pop_prioritized(&mut fast, &mut slow, &mut streak), Some(7));
-        assert_eq!(streak, 0);
-    }
-
-    #[test]
-    fn read_write_opens_without_create_or_trunc_are_served() {
-        assert!(pack_open_flags_supported(0));
-        assert!(pack_open_flags_supported(O_NONBLOCK));
-        assert!(pack_open_flags_supported(0x2));
-        for bad in [0x1, 0x2 | 0x200, 0x2 | 0x400, 0x2 | 0x8, 0x2 | 0x800, O_DIRECTORY, 0x3] {
-            assert!(!pack_open_flags_supported(bad), "{bad:#x}");
-        }
-    }
 
     #[test]
     fn iov_vectors_are_validated() {
@@ -2021,18 +1581,39 @@ mod tests {
         assert_eq!(plan_segment_reads(&v, 100, 9, 9, &mut out), 0);
     }
 
+    /// A sync read's jobs are its own slot, or every child of its split
+    /// group (the wait and the free walk these), skipping a stale child id.
+    /// Freeing runs pipeline code the host cannot link (no
+    /// scePthreadCond*), so it is not called here.
     #[test]
-    fn read_queue_is_fifo_and_refuses_when_full() {
-        let mut q = Fifo::<u32, 3>::new();
-        assert_eq!(q.pop(), None);
-        assert!(q.push(1) && q.push(2) && q.push(3));
-        assert!(!q.push(4));
-        assert_eq!(q.pop(), Some(1));
-        // A freed slot takes the next call behind the queued ones, not first.
-        assert!(q.push(4));
-        assert_eq!(
-            [q.pop(), q.pop(), q.pop(), q.pop()],
-            [Some(2), Some(3), Some(4), None]
-        );
+    fn sync_jobs_are_the_slot_or_the_split_children() {
+        use std::alloc::{alloc_zeroed, dealloc, Layout};
+        let layout = Layout::new::<PackState>();
+        unsafe {
+            let state = alloc_zeroed(layout).cast::<PackState>();
+            assert!(!state.is_null());
+            let single = allocate_virtual_aio_locked(state);
+            let parent = allocate_virtual_aio_locked(state);
+            let child = allocate_virtual_aio_locked(state);
+            let group = allocate_virtual_aio_group_locked(state);
+            let g = &mut (*state).virtual_aio_groups[group as usize];
+            g.child_count = 3;
+            for (k, i) in [parent, child].into_iter().enumerate() {
+                g.children[k] = encode_virtual_aio(i, (*state).virtual_aio[i as usize].generation);
+            }
+            // Not a virtual AIO id: skipped.
+            g.children[2] = 5;
+            let mut seen = std::vec::Vec::new();
+            assert_eq!(
+                for_each_job_locked(state, (single, INVALID_INDEX), |i| seen.push(i)),
+                1
+            );
+            assert_eq!(
+                for_each_job_locked(state, (parent, group), |i| seen.push(i)),
+                2
+            );
+            assert_eq!(seen, [single, parent, child]);
+            dealloc(state.cast(), layout);
+        }
     }
 }

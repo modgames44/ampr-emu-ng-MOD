@@ -442,8 +442,6 @@ impl AprAioReactor {
         job: &mut JobPtr,
         priorReadFencePending: bool,
         priorNativeBatchPending: bool,
-        priorLaneOverlap: bool,
-        _speculativeCommandUsed: &mut bool,
         readIssueBudget: &mut ReadIssueBudget,
         admission: &mut AioAdmissionContext,
     ) -> bool {
@@ -461,9 +459,6 @@ impl AprAioReactor {
             } else {
                 progressed = true;
             }
-        }
-        if self.publish_deferred_cross_eop_error(j!(job)) {
-            progressed = true;
         }
         if j!(job).nativeBatchReleasePending {
             let jb = j!(job);
@@ -516,7 +511,6 @@ impl AprAioReactor {
             gs,
             priorReadFencePending,
             priorNativeBatchPending,
-            priorLaneOverlap,
             readIssueBudget,
             admission,
         ) {
@@ -557,7 +551,6 @@ impl AprAioReactor {
         gs: *mut GatherScatterState,
         priorReadFencePending: bool,
         priorNativeBatchPending: bool,
-        priorLaneOverlap: bool,
         readIssueBudget: &mut ReadIssueBudget,
         admission: &mut AioAdmissionContext,
     ) -> bool {
@@ -566,10 +559,6 @@ impl AprAioReactor {
         let mut continueReadGrouping = false;
         let mut continueWithAdjacentEqueue = false;
         while j!(job).sourceOffset < j!(job).sourceBytes {
-            if self.publish_deferred_cross_eop_error(j!(job)) {
-                progressed = true;
-                break;
-            }
             if self.native_batch_wait_pending(j!(job).prioIndex as u32) {
                 break;
             }
@@ -596,7 +585,6 @@ impl AprAioReactor {
             }
             continueReadGrouping = false;
 
-            let offsetBefore = jb.sourceOffset;
             let flow = if cb_op_is_apr_read(op.op_type) {
                 self.progress_software_read_command(
                     job,
@@ -623,18 +611,12 @@ impl AprAioReactor {
                     opBytes,
                     priorReadFencePending,
                     priorNativeBatchPending,
-                    priorLaneOverlap,
                     readIssueBudget,
                     &mut progressed,
                 )
             };
             match flow {
-                CommandFlow::Stop => {
-                    let jb = j!(job);
-                    if !Self::lane_tail_runs_on(jb, op, jb.sourceOffset != offsetBefore) {
-                        break;
-                    }
-                }
+                CommandFlow::Stop => break,
                 CommandFlow::GroupReads => continueReadGrouping = true,
                 CommandFlow::AdjacentEqueue => continueWithAdjacentEqueue = true,
             }
@@ -752,23 +734,14 @@ impl AprAioReactor {
         }
         let coalesced = Self::coalesce_adjacent_reads(jb, gs, op, opBytes, &read);
         let commandIndex = jb.sourceCommandIndex as usize;
-        let mut logicalIssued = false;
         if !self.issue_software_read(
             job,
             gs,
-            &coalesced.read,
-            coalesced.sourceBytes,
+            &coalesced,
             op.buf_offset_bytes,
             commandIndex,
             admission,
-            true,
-            false,
-            &mut logicalIssued,
             readIssueBudget,
-            coalesced.commandCount,
-            &coalesced.finalGs,
-            coalesced.gatherScatterCommandCount,
-            null_mut(),
         ) {
             let jb = j!(job);
             if !Self::job_failed(jb) {
@@ -778,7 +751,7 @@ impl AprAioReactor {
         }
         *progressed = true;
         // Consecutive APR reads share the remaining request/byte quantum.
-        if logicalIssued && read_budget_open(readIssueBudget) {
+        if read_budget_open(readIssueBudget) {
             return CommandFlow::GroupReads;
         }
         CommandFlow::Stop
@@ -787,10 +760,7 @@ impl AprAioReactor {
     /// Any command other than an APR read, gather-scatter reset or marker:
     /// gated by the read fence and pending native batches, then run as a map
     /// end, software address op, local equeue write or native micro op.
-    /// Also: while an earlier job of the lane is overlapped
-    /// (`priorLaneOverlap`, lane_overlap.rs), parks every command that could
-    /// touch the lane's native batch, AMM engine or map state. Ends
-    /// job_notify_ns only when a command reached with the fence clear was
+    /// Ends job_notify_ns only when a command reached with the fence clear was
     /// consumed: a write that hits equeue backpressure or a full native batch
     /// stays parked and keeps its read-done timestamp for the retry.
     #[allow(clippy::too_many_arguments)]
@@ -801,14 +771,9 @@ impl AprAioReactor {
         opBytes: u32,
         priorReadFencePending: bool,
         priorNativeBatchPending: bool,
-        priorLaneOverlap: bool,
         readIssueBudget: &ReadIssueBudget,
         progressed: &mut bool,
     ) -> CommandFlow {
-        if priorLaneOverlap && !lane_overlap::overlap_successor_op_allowed(op.op_type) {
-            Self::cache_decoded_op(jb, op, opBytes);
-            return CommandFlow::Stop;
-        }
         let fenceClear = !priorReadFencePending && jb.completedReadSeq >= jb.latestSubmittedReadSeq;
         let sourceOffsetBefore = jb.sourceOffset;
         let flow = self.run_native_or_address_command(
@@ -824,7 +789,7 @@ impl AprAioReactor {
         // or a native batch append before its packet runs does not.
         if fenceClear
             && jb.sourceOffset != sourceOffsetBefore
-            && lane_overlap::lane_completion_signals(op)
+            && progress::lane_completion_signals(op)
             && !Self::software_op_uses_native_apr_batch(op.op_type)
         {
             jb.stat_notified();

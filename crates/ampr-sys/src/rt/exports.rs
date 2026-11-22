@@ -28,7 +28,7 @@ use super::sys::{
     off_t, SceAmmResultBuffer, SceAmmSubmitId, SceAprFileId, SceKernelEqueue,
     SCE_KERNEL_ERROR_EINVAL as EINVAL, SCE_KERNEL_ERROR_EPERM as EPERM,
 };
-use super::{amm, command_buffer as cb, equeue, hook};
+use super::{amm, command_buffer as cb, hook};
 
 use super::pack::ampr_pack_shutdown;
 use super::reactor::apr_reactor_shutdown;
@@ -109,19 +109,33 @@ extern "C" {
     ) -> c_int;
 }
 
-/// Best effort system notification; errors are ignored.
-pub(crate) unsafe fn notify(text: &[u8]) {
-    let mut req = NotifyRequest {
+/// The one request `notify` fills, under `NOTIFY_LOCK`. Static because the
+/// 3120 B request on the stack made `index_memory::refused`, which inlined
+/// `notify`, take a 0xcc8 frame on every allocation path that can refuse.
+static NOTIFY_REQ: super::sync::SyncCell<NotifyRequest> =
+    super::sync::SyncCell::new(NotifyRequest {
         head: [0; 45],
         message: [0; 3075],
-    };
+    });
+static NOTIFY_LOCK: super::sync::SpinLock = super::sync::SpinLock::new();
+
+/// Best effort system notification; errors are ignored. Out of line so a
+/// caller's frame does not hold the request: notices are rare and cold.
+#[inline(never)]
+#[cold]
+pub(crate) unsafe fn notify(text: &[u8]) {
+    let _g = NOTIFY_LOCK.lock();
+    // SAFETY: NOTIFY_LOCK serializes every user of the request.
+    let req = unsafe { &mut *NOTIFY_REQ.get() };
+    req.head = [0; 45];
     let len = text.len().min(req.message.len() - 1);
     req.message[..len].copy_from_slice(&text[..len]);
+    req.message[len..].fill(0);
     // Host tests reach this through the ledgers and have no libkernel.
     if cfg!(test) {
         return;
     }
-    let _ = unsafe { sceKernelSendNotificationRequest(0, &mut req, size_of::<NotifyRequest>(), 0) };
+    let _ = unsafe { sceKernelSendNotificationRequest(0, req, size_of::<NotifyRequest>(), 0) };
 }
 
 /// Git revision the PRX was built from: short hash, "-dirty" when tracked
@@ -190,154 +204,6 @@ unsafe fn notify_loaded() {
     let mut text = [0u8; 64];
     let n = load_notice(super::pack::pack_format().label(), &mut text);
     unsafe { notify(&text[..n]) };
-}
-
-// ---- status file -----------------------------------------------------------
-
-/// `/data/ampr_emu_status.txt`, rewritten at every module_start, both
-/// builds: what the launcher (kraken-mount `launch.rs`) checks after a
-/// launch to tell "ng loaded" from "the system libSceAmpr ran" and to show
-/// which hooks did not install. Plain text, one `key value` per line:
-/// `ampr-emu-ng <version>`, `mode <plain|lz4|zstd|pkg>`, `app0 <rw|ro>`,
-/// `hooks <rc>` (amprInstallLibkernelHooks), `index <ok|fail|skip>`, then
-/// one line per hook that did not install: `failed <symbol>` (the detour
-/// failed: coverage lost, the launcher warns), `alias <symbol>` (another
-/// name of a function hooked under its other name: served) or `absent
-/// <symbol>` (not exported by this firmware). Before 0.5.3 all three were
-/// `missing`. A failed open or write is ignored: the game runs the same
-/// without it.
-pub(crate) const STATUS_PATH: &core::ffi::CStr = c"/data/ampr_emu_status.txt";
-
-/// Status text into `out`; its length. Lines past `out` are dropped whole.
-pub(crate) fn status_text(
-    mode: &[u8],
-    writable: bool,
-    hooks_rc: c_int,
-    index: &[u8],
-    missing: &[(&[u8], u8)],
-    out: &mut [u8],
-) -> usize {
-    let mut n = 0;
-    let mut line = |parts: &[&[u8]]| {
-        let len: usize = parts.iter().map(|p| p.len()).sum::<usize>() + 1;
-        if n + len > out.len() {
-            return;
-        }
-        for p in parts {
-            out[n..n + p.len()].copy_from_slice(p);
-            n += p.len();
-        }
-        out[n] = b'\n';
-        n += 1;
-    };
-    let mut ver = [0u8; 40];
-    let mut v = 0;
-    for part in [
-        VERSION.as_bytes(),
-        if BETA_REV.is_empty() { b"" as &[u8] } else { b"-beta." },
-        BETA_REV.as_bytes(),
-    ] {
-        ver[v..v + part.len()].copy_from_slice(part);
-        v += part.len();
-    }
-    line(&[b"ampr-emu-ng ", &ver[..v]]);
-    line(&[b"mode ", mode]);
-    line(&[b"app0 ", if writable { b"rw" } else { b"ro" }]);
-    let mut num = [0u8; 12];
-    line(&[b"hooks ", decimal(hooks_rc as i64, &mut num)]);
-    line(&[b"index ", index]);
-    for (m, note) in missing {
-        let key: &[u8] = match *note {
-            hook::HOOK_NOTE_ALIAS => b"alias ",
-            hook::HOOK_NOTE_ABSENT => b"absent ",
-            _ => b"failed ",
-        };
-        line(&[key, m]);
-    }
-    n
-}
-
-/// `v` in decimal, into `buf` (12 bytes hold any i32).
-fn decimal(v: i64, buf: &mut [u8; 12]) -> &[u8] {
-    let neg = v < 0;
-    let mut u = v.unsigned_abs();
-    let mut i = buf.len();
-    loop {
-        i -= 1;
-        buf[i] = b'0' + (u % 10) as u8;
-        u /= 10;
-        if u == 0 || i == 1 {
-            break;
-        }
-    }
-    if neg {
-        i -= 1;
-        buf[i] = b'-';
-    }
-    &buf[i..]
-}
-
-/// Writes the status file (see STATUS_PATH).
-unsafe fn write_status(hooks_rc: c_int, index: &[u8]) {
-    const O_WRONLY: c_int = 0x1;
-    const O_CREAT: c_int = 0x200;
-    const O_TRUNC: c_int = 0x400;
-    const MISSING_MAX: usize = 32;
-    let mut missing: [(&[u8], u8); MISSING_MAX] = [(b"", 0); MISSING_MAX];
-    let mut count = 0;
-    unsafe {
-        hook::for_each_missing_hook(|sym, note| {
-            if count < MISSING_MAX {
-                missing[count] = (sym.to_bytes(), note);
-                count += 1;
-            }
-        })
-    };
-    let mut text = [0u8; 2048];
-    let n = status_text(
-        super::pack::pack_format().label(),
-        super::rw::app0_writable(),
-        hooks_rc,
-        index,
-        &missing[..count],
-        &mut text,
-    );
-    let Some(open) = (unsafe { super::pack::real_open() }) else {
-        return;
-    };
-    let fd = unsafe { open(STATUS_PATH.as_ptr(), O_WRONLY | O_CREAT | O_TRUNC, 0o666 as c_int) };
-    if fd < 0 {
-        return;
-    }
-    let _ = unsafe { super::index::write_all(fd, &text[..n]) };
-    if let Some(close) = unsafe { super::pack::real_close() } {
-        let _ = unsafe { close(fd) };
-    }
-}
-
-#[cfg(test)]
-#[test]
-fn status_text_lists_mode_hooks_and_missing() {
-    let mut out = [0u8; 512];
-    let n = status_text(
-        b"pkg",
-        true,
-        -1,
-        b"ok",
-        &[(b"read", hook::HOOK_NOTE_FAILED), (b"openat", hook::HOOK_NOTE_ALIAS), (b"x", hook::HOOK_NOTE_ABSENT)],
-        &mut out,
-    );
-    let beta = if BETA_REV.is_empty() { String::new() } else { format!("-beta.{BETA_REV}") };
-    assert_eq!(
-        core::str::from_utf8(&out[..n]).unwrap(),
-        format!("ampr-emu-ng {VERSION}{beta}\nmode pkg\napp0 rw\nhooks -1\nindex ok\nfailed read\nalias openat\nabsent x\n")
-    );
-    let mut small = [0u8; 20];
-    let n = status_text(b"plain", false, 0, b"skip", &[], &mut small);
-    assert!(n <= 20 && small[..n].ends_with(b"\n"));
-    let mut b = [0u8; 12];
-    assert_eq!(decimal(-2147483648, &mut b), b"-2147483648");
-    assert_eq!(decimal(0, &mut b), b"0");
 }
 
 // ---- /bench query parsing and region planning ---------------------------
@@ -1144,6 +1010,35 @@ mod mem_report {
             .kv("pread_threads_idle", idle)
             .kv("pack_workers_live", workers as u64)
             .kv("pack_workers_ceiling", worker_ceiling as u64);
+        // One line per thread created since module_start: owner (g game
+        // scePthreadCreate, p game pthread_create, a runtime, m the
+        // module_start thread), priority now (256 highest, 767 lowest) and
+        // core mask now, or the error code (an exited thread). Rows stop at
+        // 15 KiB: the body and the whole response (header included) are
+        // 16 KiB each, and 256 rows of exited threads pass that.
+        use super::super::thread_hooks::census;
+        out.kv("census_threads", census::count() as u64);
+        let mut listed = 0;
+        for i in 0..census::count() {
+            if out.len > 15 * 1024 {
+                break;
+            }
+            let Some(r) = census::row(i) else { continue };
+            listed += 1;
+            let n = r.name.iter().position(|&b| b == 0).unwrap_or(r.name.len());
+            out.s(b"thread ").s(&[r.owner]).s(b" prio ");
+            match r.prio {
+                Ok(p) => out.u(p as u64),
+                Err(rc) => out.s(b"err ").x(rc as u32),
+            };
+            out.s(b" cpus ");
+            match r.affinity {
+                Ok(m) => out.x(m as u32),
+                Err(rc) => out.s(b"err ").x(rc as u32),
+            };
+            out.s(b" ").s(&r.name[..n]).s(b"\n");
+        }
+        out.kv("census_unlisted", (census::total() - listed) as u64);
     }
 
     /// `GET /fsfail`: every distinct failed path hook call since load (op,
@@ -1167,11 +1062,31 @@ mod mem_report {
         }
     }
 
-    /// `GET /queues`: event queue waits in progress, queues with pending
-    /// events and the queues AMPR jobs signal.
+    /// `GET /queues`: the overlay's live table peaks, event queue waits in
+    /// progress, queues with pending events and the queues AMPR jobs signal.
     /// Its own page, so a busy title cannot crowd `/metrics` out of its
     /// 16 KiB buffer.
     fn queues(out: &mut Text) {
+        // Live peaks against capacity (rt/equeue.rs `equeue_peaks`), to size
+        // the overlay's fixed tables from a measurement.
+        let (peak, cap) = super::super::equeue::equeue_peaks();
+        out.s(b"eqpeak queues=")
+            .u(peak.queues.into())
+            .s(b"/")
+            .u(cap.queues.into())
+            .s(b" regs=")
+            .u(peak.registrations.into())
+            .s(b"/")
+            .u(cap.registrations.into());
+        out.s(b" pending=")
+            .u(peak.pending.into())
+            .s(b"/")
+            .u(cap.pending.into())
+            .s(b" extras=")
+            .u(peak.extras.into())
+            .s(b"/")
+            .u(cap.extras.into())
+            .s(b"\n");
         // Event queue waits in progress and queues with pending events
         // (rt/equeue.rs `equeue_views`).
         let mut views = [super::super::equeue::EqueueView::default(); 48];
@@ -1198,8 +1113,8 @@ mod mem_report {
                     .u(v.registrations.into());
                 out.s(b" native_intent=")
                     .u(v.native_intent.into())
-                    .s(b" parked=");
-                out.u(v.parked.into()).s(b" trigger=").u(v.trigger.into());
+                    .s(b" trigger=")
+                    .u(v.trigger.into());
                 out.s(b" flags=").u(v.flags.into());
             } else {
                 out.s(b" untracked");
@@ -1380,10 +1295,13 @@ mod mem_report {
             // refused by a cap counts in ledger_alloc_refused, a failed
             // pool one in pool_alloc_failed.
             use super::super::index_memory as im;
+            // The caps as they are now: the Index cap's idle room moves to
+            // the cache once the index is built (grow_cache_from_index).
+            let (index_cap, cache_cap) = im::live_caps();
             out.kv("index_mem_bytes", im::index_mem_bytes() as u64)
-                .kv("index_mem_cap_bytes", im::INDEX_MEMORY_MAX as u64);
+                .kv("index_mem_cap_bytes", index_cap as u64);
             out.kv("cache_mem_bytes", im::cache_mem_bytes() as u64)
-                .kv("cache_mem_cap_bytes", im::CACHE_MEMORY_MAX as u64);
+                .kv("cache_mem_cap_bytes", cache_cap as u64);
             out.kv("buffer_mem_bytes", im::buffer_mem_bytes() as u64)
                 .kv("buffer_mem_cap_bytes", im::BUFFER_MEMORY_MAX as u64);
             out.kv("ledger_mem_bytes", im::ledger_mem_bytes() as u64)
@@ -1443,9 +1361,8 @@ mod mem_report {
             out.kv("thread_mode", super::super::thread_hooks::pressure() as u64);
             let (workers, worker_ceiling) = super::super::pack::pack_workers_state();
             out.kv("pack_workers_ceiling", worker_ceiling as u64);
-            let (fd_live, fd_load) = super::super::pack::read_threads_load();
             // Per group (rt/thread_hooks.rs LoadGroup): live, peak, target,
-            // busy median (rounded up), retired by load, under pressure.
+            // retired under pressure.
             let groups = [
                 (
                     &b"decode"[..],
@@ -1453,18 +1370,15 @@ mod mem_report {
                     super::super::pack::pack_workers_load(),
                 ),
                 (b"pread", live, super::super::reactor::pread_pool_load()),
-                (b"fdread", fd_live as u64, fd_load),
             ];
-            const KEYS: [&[u8]; 6] = [
+            const KEYS: [&[u8]; 4] = [
                 b"_threads_live ",
                 b"_threads_peak ",
                 b"_target ",
-                b"_busy_median ",
-                b"_retired_load ",
                 b"_retired_pressure ",
             ];
             for (name, live, load) in groups {
-                let values = [live, load[0], load[1], load[2], load[3], load[4]];
+                let values = [live, load[0], load[1], load[2]];
                 for (key, v) in KEYS.iter().zip(values) {
                     out.s(name).s(key).u(v).s(b"\n");
                 }
@@ -1527,7 +1441,6 @@ mod mem_report {
                 b"next launch\n"
             });
         }
-        out.s(b"profile=low|medium|high sets decoded_mib, workers, pipelines\n");
     }
 
     unsafe fn serve(listener: c_int, start_ns: u64) -> ! {
@@ -1556,6 +1469,12 @@ mod mem_report {
                 queues(metrics);
             } else if n > 0 && req[..n as usize].starts_with(b"GET /modules") {
                 unsafe { modules(metrics) };
+            } else if n > 0 && req[..n as usize].starts_with(b"GET /crash") {
+                // Fault this thread on purpose so the system's core dump
+                // captures the game as it is now, e.g. a frozen title for
+                // offline analysis.
+                unsafe { core::ptr::null_mut::<u8>().write_volatile(0) };
+                unreachable!();
             } else {
                 body(start_ns, metrics);
             }
@@ -1641,10 +1560,18 @@ fn flex_free_now() -> u64 {
 #[no_mangle]
 pub unsafe extern "C" fn module_start(_args: usize, _argp: *const c_void) -> c_int {
     #[cfg(feature = "mem_report")]
-    FLEX_AT_START.store(flex_free_now(), core::sync::atomic::Ordering::Relaxed);
+    {
+        FLEX_AT_START.store(flex_free_now(), core::sync::atomic::Ordering::Relaxed);
+        // The game thread that loads the module, for /threads.
+        super::thread_hooks::census::note(
+            b'm',
+            unsafe { super::reactor::scePthreadSelf() },
+            c"module_start".as_ptr(),
+        );
+    }
     // The knobs once (debug only; release returns at once), before the hooks
     // and the pack state, so titles with no packs read them too (thread
-    // budget, pool size, equeue_local).
+    // budget, pool size).
     unsafe { super::tune::load() };
     // Before any hook: the mode picks the hooks and the notification text.
     unsafe { super::pack::select_pack_format() };
@@ -1654,6 +1581,7 @@ pub unsafe extern "C" fn module_start(_args: usize, _argp: *const c_void) -> c_i
     {
         unsafe { super::blackbox::open() };
         super::pack::log_discovery();
+        super::blackbox::rw(super::rw::app0_access_errno());
     }
     unsafe { notify_loaded() };
     let rc = unsafe { hook::amprInstallLibkernelHooks() };
@@ -1664,18 +1592,17 @@ pub unsafe extern "C" fn module_start(_args: usize, _argp: *const c_void) -> c_i
     // load AMPRIDX3 and the pack manifest here, before the game runs (zstd
     // also mounts ampr_zstd.index and joins it to the view). Without a
     // shipped index this fails at once: ensure_ready(false) never builds one.
-    // A title with no packs skips it and loads its index on the first AMPR
-    // call.
-    let index: &[u8] = if !super::pack::packs_present() || rc != 0 {
-        b"skip"
-    } else if unsafe { super::index::ensure_ready(false) }
-        && unsafe { super::pack::ampr_pack_ensure_manifest_ready_safe() }
+    // A title with no packs loads its shipped index here too, so the load
+    // (frames of 0x1068 B for `load_compact_index` and 0x1008 B for the
+    // CRC, more than the chain that overflowed a game stack in v0.4.0)
+    // never runs on a game thread. With no shipped index it still
+    // walk-builds on the first AMPR call.
+    if rc == 0
+        && unsafe { super::index::ensure_ready(false) }
+        && super::pack::packs_present()
     {
-        b"ok"
-    } else {
-        b"fail"
-    };
-    unsafe { write_status(rc, index) };
+        unsafe { super::pack::ampr_pack_ensure_manifest_ready_safe() };
+    }
     // Only after hooks install: a failed module_start may be unloaded.
     #[cfg(feature = "mem_report")]
     if rc == 0 {
@@ -1703,15 +1630,15 @@ pub unsafe extern "C" fn module_stop(_args: usize, _argp: *const c_void) -> c_in
 
 // ---- sceAmprAmm* ---------------------------------------------------------
 
+// The constructor and destructor did only the equeue queue classification's
+// command-buffer registry, which was removed; they stay exported, as retail.
 #[no_mangle]
-pub unsafe extern "C" fn sceAmprAmmCommandBufferConstructor(this: *mut Cb) -> i64 {
-    unsafe { equeue::apr_equeue_register_amm_command_buffer(this.cast()) };
+pub unsafe extern "C" fn sceAmprAmmCommandBufferConstructor(_this: *mut Cb) -> i64 {
     0
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn sceAmprAmmCommandBufferDestructor(this: *mut Cb) -> i64 {
-    unsafe { equeue::apr_equeue_unregister_amm_command_buffer(this.cast()) };
+pub unsafe extern "C" fn sceAmprAmmCommandBufferDestructor(_this: *mut Cb) -> i64 {
     0
 }
 

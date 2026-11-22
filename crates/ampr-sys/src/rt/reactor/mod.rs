@@ -53,12 +53,13 @@ pub(crate) use worker::{
 pub(crate) use worker::pread_pool_yield;
 #[cfg(feature = "mem_report")]
 pub(crate) use worker::pread_pool_state;
-pub(crate) use pread_pool::{pread_pool_ask, pread_pool_live, pread_pool_reap};
+pub(crate) use pread_pool::{
+    pread_pool_ask, pread_pool_grow, pread_pool_live, pread_pool_queue_pack, pread_pool_reap,
+};
 #[cfg(feature = "mem_report")]
 pub(crate) use pread_pool::pread_pool_load;
 #[cfg(feature = "mem_report")]
 pub(crate) use native::EQUEUE_TARGETS;
-mod lane_overlap;
 mod loose_pread;
 mod pread_pool;
 pub(crate) use loose_pread::{LooseGpuRegions, LoosePartDone, LoosePartResult};
@@ -85,7 +86,6 @@ pub(crate) const AMPR_EMU_APR_AIO_DELETE_RETRY_LIMIT: u32 = 4096;
 pub(crate) const AMPR_EMU_APR_AIO_DELETE_TIMEOUT_NS: u64 = 5_000_000_000;
 pub(crate) const AMPR_EMU_APR_AIO_DISPATCH_QUANTUM_BYTES: u32 = 0x80000;
 pub(crate) const AMPR_EMU_APR_AIO_INFLIGHT: u32 = 32;
-pub(crate) const AMPR_EMU_APR_AIO_LATENCY_ESCAPE_SLOTS: u32 = 4;
 pub(crate) const AMPR_EMU_APR_AIO_POLL_BACKGROUND_INITIAL_MIN_NS: u32 = 250_000;
 pub(crate) const AMPR_EMU_APR_AIO_POLL_BACKOFF_MAX_NS: u32 = 1_000_000;
 pub(crate) const AMPR_EMU_APR_AIO_POLL_CRITICAL_INITIAL_NS: u32 = 10_000;
@@ -130,6 +130,12 @@ pub(crate) const AMPR_EMU_APR_FD_PRESSURE_COOLDOWN_MS: u64 = 2000;
 pub(crate) const AMPR_EMU_APR_PER_READ_ACTIVE_BYTES: u64 = 0x200000;
 pub(crate) const AMPR_EMU_APR_PER_READ_ACTIVE_CHUNKS: u32 = 4;
 pub(crate) const AMPR_EMU_APR_REACTOR_THREAD_AFFINITY: u64 = 0x3f;
+/// The reactor, the highest; the pread pool runs at the workers' 384
+/// (pread_pool.rs). With reactor and pool both at 384 a title whose audio
+/// threads run at 256 on every CPU waited
+/// 3,092 us per read against 2,427-2,492 (disk read +17%, pool queue 2x,
+/// worker step unchanged), and a title with its GameThread at 300 did not
+/// change (debug /metrics, /threads, one run each).
 pub(crate) const AMPR_EMU_APR_REACTOR_THREAD_PRIORITY: c_int = 256;
 pub(crate) const AMPR_EMU_APR_READ_CHUNK_QUANTUM: u32 = 8;
 pub(crate) const AMPR_EMU_APR_READ_CREDIT_GRANULE_BYTES: u64 = 0x10000;
@@ -137,23 +143,16 @@ pub(crate) const AMPR_EMU_APR_READ_PASS_MAX_BYTES: u64 = 0x80000;
 /// Blocking pread pool for the pack's physical reads (pread_pool.rs). Kernel AIO on BFS
 /// serves 1-2 requests at a time; 32 parallel preads reached 1.6-2.0 GB/s on
 /// a console (bench). At most 6 threads in both builds, grown by backlog and
-/// retired by load (`LoadGroup` in rt/thread_hooks.rs;
+/// kept once started; pressure mode after a failed game thread creation
+/// gives idle ones back (`LoadGroup` in rt/thread_hooks.rs;
 /// tune::RELEASE_PREAD_THREADS has the measurements), shared by pack groups
-/// and split loose reads. Their 32 KiB stacks are libkernel memory, not the
-/// internal pool.
+/// and split loose reads. Their 64 KiB stacks come from the pool's stack
+/// block (rt/thread_stack.rs).
 pub(crate) const AMPR_EMU_PACK_PREAD_WORKERS: usize = crate::rt::tune::RELEASE_PREAD_THREADS as usize;
 pub(crate) const AMPR_EMU_PACK_PREAD_TASKS: usize = 128;
 /// Loose APR reads (the game's real-fd reads) through the pread pool
 /// (loose_pread.rs). Release default; the debug build reads `loose_pread`.
 pub(crate) const AMPR_EMU_APR_LOOSE_PREAD: bool = true;
-/// Let a lane's next job parse while the head job has only completion
-/// commands (EOP writes, nops, markers) left (lane_overlap.rs). Off in
-/// release; the debug build reads `lane_eop_overlap` (default 0). A game,
-/// loose files, internal SSD, 64 KiB parts, debug /metrics, estimated wait
-/// per job (first issue + reads + notify):
-/// 32 threads off ~6.1 ms, 32 threads on ~7.7 ms (28 loose tasks: the extra
-/// reads only queue), 64 threads off ~6.6 ms, on ~6.4 ms.
-pub(crate) const AMPR_EMU_APR_LANE_EOP_OVERLAP: bool = false;
 /// Part size (KiB) a loose pool read is split into, parts preaded in
 /// parallel into the same destination; the debug build reads
 /// `loose_pread_part_kib`. A game, loose files, internal SSD, 32 threads,
@@ -164,10 +163,11 @@ pub(crate) const AMPR_EMU_APR_LOOSE_PREAD_PART_KIB: u32 = 64;
 /// AMPR_EMU_APR_AIO_INFLIGHT, the most loose reads admission lets in flight.
 /// Debug: AMPR_EMU_PACK_PREAD_WORKERS (6), so the thread count alone sets
 /// the cap. The cap in effect is
-/// min(this, max(threads - AMPR_EMU_APR_LOOSE_PREAD_PACK_RESERVE, 1)), 2 at
-/// 6 threads, so at least 96 of the 128 AMPR_EMU_PACK_PREAD_TASKS stay free
-/// for pack groups; a full table returns EAGAIN and the read goes unsplit or
-/// to kernel AIO (loose_pread.rs).
+/// min(this, max(threads - loose_pread_pack_reserve(), 1)), 2 at 6
+/// threads with packs (6 without), so at least 96 of the 128
+/// AMPR_EMU_PACK_PREAD_TASKS stay free for pack groups; a full table
+/// returns EAGAIN and the read goes unsplit or to kernel AIO
+/// (loose_pread.rs).
 pub(crate) const AMPR_EMU_APR_LOOSE_PREAD_TASKS_MAX: u32 = if crate::rt::tune::ON {
     AMPR_EMU_PACK_PREAD_WORKERS as u32
 } else {
@@ -179,8 +179,22 @@ const _: () = assert!(
 );
 /// pread threads loose reads never take: 4 of the 6 threads
 /// (tune::RELEASE_PREAD_THREADS; debug `pread_threads`, default and max 6)
-/// stay for pack tasks (console peak was 1.9 busy pack threads).
+/// stay for pack tasks (console peak was 1.9 busy pack threads). Only a
+/// title that ships packs keeps it (`loose_pread_pack_reserve`).
 pub(crate) const AMPR_EMU_APR_LOOSE_PREAD_PACK_RESERVE: usize = 4;
+/// The pread threads loose reads leave for pack tasks: the reserve in a
+/// title with packs, 0 without, since no pack task ever comes there. With
+/// the reserve a title without packs split a loose read into at most 2
+/// parts at 6 threads; without it up to 6. The 1.10 ms per read of 64 KiB
+/// parts (docs/read-path-tuning.md) was at 32 threads with 98% of reads
+/// split.
+pub(crate) fn loose_pread_pack_reserve() -> usize {
+    if crate::rt::pack::packs_present() {
+        AMPR_EMU_APR_LOOSE_PREAD_PACK_RESERVE
+    } else {
+        0
+    }
+}
 pub(crate) const AMPR_EMU_APR_COMMAND_BUFFER_LIVE_MAX: usize = 4096;
 pub(crate) const AMPR_EMU_FD_OPEN_BUDGET_CAP: usize = 50;
 pub(crate) const AMPR_EMU_FD_CACHE_CAP: usize = 45; // min(50, max(50*90/100, 1))
@@ -190,11 +204,6 @@ pub(crate) const AMPR_EMU_FD_CACHE_OPEN_PRESSURE_IDLE_CLOSE_PERCENT: c_uint = 10
 pub(crate) const AMPR_EMU_FD_DIRECT_CAP_PRESSURE_PERCENT: usize = 60;
 pub(crate) const AMPR_EMU_FD_DIRECT_CAP_RESERVE: usize = 12;
 pub(crate) const AMPR_EMU_FD_DIRECT_OPEN_SAFETY_RESERVE: usize = 6;
-pub(crate) const AMPR_EMU_LOOSE_COALESCE_MAX_BYTES: u64 = 0x80000;
-pub(crate) const AMPR_EMU_LOOSE_COALESCE_MAX_COMMANDS: u32 = 8;
-pub(crate) const AMPR_EMU_LOOSE_GS_COALESCE_MAX_BYTES: u64 = AMPR_EMU_LOOSE_COALESCE_MAX_BYTES;
-pub(crate) const AMPR_EMU_LOOSE_GS_COALESCE_MAX_COMMANDS: u32 =
-    AMPR_EMU_LOOSE_COALESCE_MAX_COMMANDS;
 /// Base cap of the fd open budget.
 pub(crate) const kFdOpenBudgetBaseCap: usize = AMPR_EMU_FD_OPEN_BUDGET_CAP;
 /// Maximum number of live APR command buffers.
@@ -317,12 +326,24 @@ unsafe extern "C" {
         arg: *mut c_void,
         name: *const c_char,
     ) -> c_int;
-    pub(crate) fn scePthreadJoin(thread: ScePthread, value: *mut *mut c_void) -> c_int;
+    /// The import; runtime code joins through `scePthreadJoin` below.
+    #[link_name = "scePthreadJoin"]
+    fn scePthreadJoin_import(thread: ScePthread, value: *mut *mut c_void) -> c_int;
     pub(crate) fn scePthreadSelf() -> ScePthread;
     pub(crate) fn scePthreadRename(thread: ScePthread, name: *const c_char) -> c_int;
     pub(crate) fn scePthreadGetprio(thread: ScePthread, prio: *mut c_int) -> c_int;
     pub(crate) fn scePthreadSetprio(thread: ScePthread, prio: c_int) -> c_int;
     pub(crate) fn scePthreadSetaffinity(thread: ScePthread, mask: SceKernelCpumask) -> c_int;
+}
+
+/// scePthreadJoin for the runtime's own threads: once the thread is gone,
+/// its pool stack is free again (rt/thread_stack.rs). Every runtime join
+/// goes through here (pack/mod.rs re-exports it).
+pub(crate) unsafe fn scePthreadJoin(thread: ScePthread, value: *mut *mut c_void) -> c_int {
+    let rec = crate::rt::thread_stack::detach(thread);
+    let rc = unsafe { scePthreadJoin_import(thread, value) };
+    unsafe { crate::rt::thread_stack::release(rec, rc == 0) };
+    rc
 }
 
 /// SDK macro `sceKernelAioInitialize(param)`.
@@ -421,6 +442,9 @@ const _: () = assert!(
 // ---- external AIO broker -------------------------------------------------------
 
 pub(crate) const kAprExternalAioCapacity: u32 = 32;
+/// Most requests one pread pool queue call takes: the parts of one split
+/// loose read (loose_pread.rs). The name is upstream's grouped external
+/// submit, which is gone; an external read is one request.
 pub(crate) const kAprExternalAioGroupMaxRequests: usize = 32;
 
 #[repr(u8)]
@@ -574,16 +598,6 @@ pub(crate) const SCE_AMPR_APR_FILEID_INVALID: u32 = u32::MAX;
 // ---- loose adaptive reads -----------------------------------------------------
 
 #[repr(u8)]
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
-pub(crate) enum AmprLooseReadClass {
-    Latency = 0,
-    #[default]
-    Balanced = 1,
-    Bulk = 2,
-    Count = 3,
-}
-
-#[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum AmprLooseGsReadKind {
     #[default]
@@ -618,21 +632,16 @@ pub(crate) struct AmprLooseGsResolvedRead {
     pub(crate) valid: bool,
 }
 
-pub(crate) fn ampr_loose_chain_chunk_limit(
-    readClass: AmprLooseReadClass,
-    waitingLatency: bool,
-    constrained: bool,
-    shared: bool,
-    hardLimit: u32,
-) -> u32 {
+/// Chunks one loose chain may have in flight: 1 when constrained, else at
+/// most 2. Upstream's latency and bulk read classes were never ported (every
+/// read was the balanced class), so only the balanced arms remain.
+pub(crate) fn ampr_loose_chain_chunk_limit(constrained: bool, hardLimit: u32) -> u32 {
     if hardLimit == 0 {
         0
-    } else if waitingLatency || constrained || readClass == AmprLooseReadClass::Latency {
+    } else if constrained {
         1
-    } else if shared || readClass != AmprLooseReadClass::Bulk {
-        hardLimit.min(2)
     } else {
-        hardLimit
+        hardLimit.min(2)
     }
 }
 
@@ -782,8 +791,6 @@ pub(crate) struct AprAioReadDesc {
     pub(crate) offset: u64,
     pub(crate) fileSize: usize,
     pub(crate) errorOff: u32,
-    pub(crate) readClass: AmprLooseReadClass,
-    pub(crate) coalescedCommandCount: u8,
     pub(crate) bypassFdCache: bool,
     pub(crate) closeAfter: bool,
     pub(crate) closeAfterPhysical: bool,
@@ -795,8 +802,6 @@ impl Default for AprAioReadDesc {
     fn default() -> Self {
         Self {
             fd: -1,
-            readClass: AmprLooseReadClass::Balanced,
-            coalescedCommandCount: 1,
             ..unsafe { core::mem::zeroed() }
         }
     }
@@ -885,8 +890,9 @@ pub(crate) const kInvalid: u32 = u32::MAX;
 const _: () = {
     assert!(kMaxActiveReads == 64 && kBaseActiveReads == 32 && kReadChainPoolCapacity == 79);
     assert!(kMaxActiveReads as usize + kExternalAioCapacity as usize <= SCE_KERNEL_AIO_ID_NUM_MAX);
-    assert!(kAprExternalAioGroupMaxRequests <= kAioCombinedSubmitRequestLimit);
     assert!(kReadCompletionRingBits > kMaxActiveReads as u64);
+    // The idle reactor wait is bounded by it (idle.rs drain_incoming).
+    assert!(kFdCacheMaintenanceIntervalNs != 0);
     assert!(kSyntheticLowerSlotCapacity <= kSyntheticSubmitIdSlotMask + 1);
 };
 
@@ -950,21 +956,10 @@ pub(crate) struct ReadIssueBudget {
     pub(crate) held: bool,
 }
 
-#[repr(u8)]
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
-pub(crate) enum AdaptiveReadWindowMode {
-    #[default]
-    Pressure = 0,
-    Contended = 1,
-    Shared = 2,
-    Exclusive = 3,
-}
-
 #[derive(Clone, Copy, Default)]
 pub(crate) struct AdaptiveReadWindow {
     pub(crate) chunks: u32,
     pub(crate) bytes: u64,
-    pub(crate) mode: AdaptiveReadWindowMode,
 }
 
 #[derive(Clone, Copy)]
@@ -1129,7 +1124,6 @@ pub(crate) struct JobState {
     pub(crate) syntheticLowerSlot: u32,
     pub(crate) syntheticLowerGeneration: u32,
     pub(crate) syntheticWaitPublished: bool,
-    pub(crate) schedulingWaiterClaimed: AtomicBool,
     pub(crate) nativeSubmitBytes: u32,
     pub(crate) nativeSubmitFirstType: OpType,
     pub(crate) nativeSubmitType: c_int,
@@ -1148,15 +1142,6 @@ pub(crate) struct JobState {
     pub(crate) statAcceptNs: u64,
     #[cfg(feature = "mem_report")]
     pub(crate) statReadDoneNs: u64,
-    /// Debug only (lane_overlap.rs, knob `lane_eop_overlap`): source offset + 1
-    /// at which the remaining commands were last classified (0: never), and
-    /// whether they were all completion commands. A positive answer holds for
-    /// every later offset (a suffix of a completion-only tail is one too); a
-    /// negative one only at the same offset. Release has no fields.
-    #[cfg(feature = "mem_report")]
-    pub(crate) laneTailMark: u32,
-    #[cfg(feature = "mem_report")]
-    pub(crate) laneTailCompletionOnly: bool,
     /// Debug only (job_state.rs `stat_gs_resolved`, stats.rs gs_retry_*): the
     /// file id and offset the gather/scatter read at the cursor first resolved
     /// to from the lane cursor, compared when a retry re-resolves it. Zeroed
@@ -1276,11 +1261,14 @@ pub(crate) enum ExternalAioState {
     Submitted = 4,
 }
 
+/// One external read: one request. Upstream's grouped submit (up to 32
+/// requests per slot, submitted together) had no caller in ampr-emu-ng, so
+/// the slot holds a single request.
 pub(crate) struct ExternalAioRead {
-    pub(crate) requests: [SceKernelAioRWRequest; kAprExternalAioGroupMaxRequests],
-    pub(crate) aioIds: [SceKernelAioSubmitId; kAprExternalAioGroupMaxRequests],
-    pub(crate) deleteRetries: [u32; kAprExternalAioGroupMaxRequests],
-    pub(crate) deleteFirstFailureNs: [u64; kAprExternalAioGroupMaxRequests],
+    pub(crate) request: SceKernelAioRWRequest,
+    pub(crate) aioId: SceKernelAioSubmitId,
+    pub(crate) deleteRetries: u32,
+    pub(crate) deleteFirstFailureNs: u64,
     pub(crate) context: *mut c_void,
     pub(crate) callback: AprExternalAioCallback,
     pub(crate) submitTimeNs: u64,
@@ -1288,21 +1276,21 @@ pub(crate) struct ExternalAioRead {
     pub(crate) nextPollTimeNs: u64,
     pub(crate) pollBackoffNs: u32,
     pub(crate) generation: u32,
+    /// Always 1; the pread pool checks a task's part index against it.
     pub(crate) requestCount: u32,
+    /// 1 while the request is submitted and not yet finished, else 0.
     pub(crate) remainingCount: u32,
-    pub(crate) totalBytes: u64,
     pub(crate) completionState: c_int,
     pub(crate) aioPriority: c_int,
     pub(crate) ioClass: AprExternalAioClass,
     pub(crate) state: ExternalAioState,
-    pub(crate) grouped: bool,
     /// Served by the pread pool (pread_pool.rs) instead of kernel AIO; set at submit.
     pub(crate) preadBacked: bool,
     pub(crate) published: AtomicBool,
-    /// mem_report counters per request (see `ActiveRead::statSubmitNs`).
-    pub(crate) statSubmitNs: [u64; kAprExternalAioGroupMaxRequests],
-    pub(crate) statLastPollNs: [u64; kAprExternalAioGroupMaxRequests],
-    pub(crate) statPolls: [u32; kAprExternalAioGroupMaxRequests],
+    /// mem_report counters (see `ActiveRead::statSubmitNs`).
+    pub(crate) statSubmitNs: u64,
+    pub(crate) statLastPollNs: u64,
+    pub(crate) statPolls: u32,
 }
 impl ExternalAioRead {
     /// Applies the non-zero member initializers to zeroed storage.
@@ -1333,7 +1321,6 @@ pub(crate) struct AioItemRef {
     pub(crate) external: ExternalAioRef,
     pub(crate) isExternal: bool,
     pub(crate) externalWasDeferred: bool,
-    pub(crate) externalRequestIndex: u32,
 }
 
 pub(crate) struct AioSubmitBatch {
@@ -1344,15 +1331,8 @@ pub(crate) struct AioSubmitBatch {
     pub(crate) aioPriority: c_int,
 }
 
-pub(crate) struct ExternalAioGroupBatch {
-    pub(crate) items: [AioItemRef; kAprExternalAioCapacity as usize],
-    pub(crate) count: usize,
-    pub(crate) aioPriority: c_int,
-}
-
 pub(crate) struct AioSubmitRound {
     pub(crate) batches: [AioSubmitBatch; 3],
-    pub(crate) groupedExternal: [ExternalAioGroupBatch; 3],
 }
 impl AioSubmitRound {
     /// Resets in place to the empty state (no large stack temporaries).
@@ -1363,11 +1343,6 @@ impl AioSubmitRound {
             b.items = [AioItemRef::default(); SCE_KERNEL_AIO_REQUEST_NUM_MAX];
             b.count = 0;
             b.aioPriority = SCE_KERNEL_AIO_PRIORITY_MID;
-        }
-        for g in &mut self.groupedExternal {
-            g.items = [AioItemRef::default(); kAprExternalAioCapacity as usize];
-            g.count = 0;
-            g.aioPriority = SCE_KERNEL_AIO_PRIORITY_MID;
         }
     }
 }
@@ -1450,7 +1425,6 @@ impl ActiveReadIt {
 pub(crate) struct AioAdmissionSnapshot {
     pub(crate) activeCount: usize,
     pub(crate) smallCount: usize,
-    pub(crate) classActive: [usize; AmprLooseReadClass::Count as usize],
     pub(crate) oldestSubmittedTimeNs: u64,
     pub(crate) oldestSubmittedAgeMs: u64,
     /// U, H, N
@@ -1543,16 +1517,7 @@ pub(crate) struct CoalescedSoftwareRead {
     pub(crate) read: SoftwareRead,
     pub(crate) finalGs: GatherScatterState,
     pub(crate) sourceBytes: u32,
-    pub(crate) commandCount: u32,
     pub(crate) gatherScatterCommandCount: u32,
-}
-impl Default for CoalescedSoftwareRead {
-    fn default() -> Self {
-        Self {
-            commandCount: 1,
-            ..unsafe { core::mem::zeroed() }
-        }
-    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1601,7 +1566,10 @@ pub(crate) struct PreadThreadArg {
 
 /// One request of a pread-backed external group. Only the reactor publishes
 /// or retires a slot; a pool thread claims it under preadMutex and publishes
-/// completion with Release.
+/// completion with Release. A pack task (`packCallback` set) is the
+/// exception: a pack worker publishes it (queue_pack_pread) and the pool
+/// thread that runs it retires it and calls `packCallback` itself, so it
+/// never reaches the reactor (it is never DONE).
 pub(crate) struct PreadTask {
     pub(crate) state: AtomicU32,
     pub(crate) request: SceKernelAioRWRequest,
@@ -1617,6 +1585,10 @@ pub(crate) struct PreadTask {
     /// The pread result, written by the pool thread before DONE; a loose
     /// part task (null `request.result`) reports only here.
     pub(crate) returnValue: i64,
+    /// Pack task: completion callback and its context (the pipeline); None
+    /// for a reactor task.
+    pub(crate) packCallback: AprExternalAioCallback,
+    pub(crate) packContext: *mut c_void,
 }
 
 // ---- AprAioReactor ----------------------------------------------------------------
@@ -1661,6 +1633,11 @@ pub(crate) struct AprAioReactor {
     pub(crate) preadArgs: [PreadThreadArg; AMPR_EMU_PACK_PREAD_WORKERS],
     /// Live pool threads (started, not exited), under preadMutex.
     pub(crate) preadThreadCount: usize,
+    /// Of preadThreadCount, the threads whose scePthreadCreate has not
+    /// returned yet, under preadMutex: a creation that fails takes its count
+    /// back, so a task queued for it, or a thread that left because it was
+    /// counted, would strand a queued read (pread_pool.rs `started`).
+    pub(crate) preadStarting: usize,
     /// Idle threads, exits asked of the pool, and the most threads it may
     /// grow to (0 until started); all under preadMutex.
     pub(crate) preadIdle: u32,
@@ -1677,6 +1654,16 @@ pub(crate) struct AprAioReactor {
     pub(crate) preadReapPending: AtomicBool,
     pub(crate) preadStop: bool,
     pub(crate) preadPendingCount: u32,
+    /// Tasks in PREAD_QUEUED (not yet taken by a thread), changed under
+    /// preadMutex; spin_for_task reads it without the lock.
+    pub(crate) preadQueuedCount: AtomicU32,
+    /// Where the next free-task scan starts, under preadMutex: one past the
+    /// last task queued (pread_pool.rs `take_free_tasks`).
+    pub(crate) preadFreeHint: u32,
+    /// Per ActiveRead slot: its listGeneration (high 32 bits) and the loose
+    /// part tasks not yet DONE (low 32), so only the last part's thread wakes
+    /// the reactor (pread_pool.rs `loose_part_finished`).
+    pub(crate) preadLoosePartsLeft: [AtomicU64; kMaxActiveReads as usize],
     pub(crate) preadNextSequence: u64,
     pub(crate) preadTasks: [PreadTask; AMPR_EMU_PACK_PREAD_TASKS],
     /// Tasks held by loose reads (loose_pread.rs, part tasks of a split read

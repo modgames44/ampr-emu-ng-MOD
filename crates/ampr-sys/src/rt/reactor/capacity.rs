@@ -65,6 +65,10 @@ impl AprAioReactor {
             self.stage_active_aio_poll(&mut batch, hotIt);
         }
         let mut slotIndex = 0u32;
+        // Only kernel-AIO externals are polled; none submitted skips the scan.
+        if self.externalAioSubmittedCount.load(Ordering::Acquire) == 0 {
+            slotIndex = kExternalAioCapacity;
+        }
         while slotIndex < kExternalAioCapacity && batch.count < kAioPollBatchLimit {
             let external = &self.externalAioReads[slotIndex as usize];
             if external.published.load(Ordering::Acquire)
@@ -107,7 +111,6 @@ impl AprAioReactor {
         let errorOff = active.desc.errorOff;
         let finishTimeNs = time_counter_now();
         let completeAgeMs = Self::active_read_age_ms(active, finishTimeNs);
-        self.note_aio_age_ms(completeAgeMs);
 
         let mut rc = 0;
         if finalState == SCE_KERNEL_AIO_STATE_ABORTED {
@@ -152,7 +155,7 @@ impl AprAioReactor {
             self.note_slow_aio_completion(finishTimeNs, completeAgeMs);
         }
         if rc == 0 && shortRead {
-            self.set_or_defer_read_command_error(
+            self.set_command_error(
                 jobRef,
                 c"aio-short-read".as_ptr(),
                 SCE_AMPR_ERROR_APR_INVALIDFILEOFFSET,
@@ -168,7 +171,6 @@ impl AprAioReactor {
 
         if rc != 0
             && !Self::job_failed(jobRef)
-            && !Self::cross_eop_suffix_is_canceled(jobRef, errorOff)
             && (completionEfault || completionRetryable)
             && !efaultRetryLimitReached
             && !completionRetryLimitReached
@@ -179,7 +181,6 @@ impl AprAioReactor {
                 AMPR_EMU_APR_AIO_COMPLETION_RETRY_DELAY_NS
             };
             if completionEfault {
-                self.note_efault_retry_event();
                 if active.ammEfaultRetries != u32::MAX {
                     active.ammEfaultRetries += 1;
                 }
@@ -198,7 +199,7 @@ impl AprAioReactor {
         }
 
         if rc != 0 && !Self::job_failed(jobRef) && completionRetryLimitReached {
-            self.set_or_defer_read_command_error(
+            self.set_command_error(
                 jobRef,
                 c"aio-completion-retry-limit".as_ptr(),
                 apr_backend_read_error_to_apr(rc),
@@ -207,8 +208,7 @@ impl AprAioReactor {
             );
         }
         if rc != 0 && !Self::job_failed(jobRef) && efaultRetryLimitReached {
-            self.note_efault_retry_limit_event();
-            self.set_or_defer_read_command_error(
+            self.set_command_error(
                 jobRef,
                 c"aio-efault-retry-limit".as_ptr(),
                 apr_backend_read_error_to_apr(rc),
@@ -217,7 +217,7 @@ impl AprAioReactor {
             );
         }
         if rc != 0 && !Self::job_failed(jobRef) && !completionEfault && !completionRetryable {
-            self.set_or_defer_read_command_error(
+            self.set_command_error(
                 jobRef,
                 c"aio-completion-nonretryable".as_ptr(),
                 apr_backend_read_error_to_apr(rc),
@@ -232,8 +232,6 @@ impl AprAioReactor {
         apr_release_aio_read_desc(&mut active.desc);
         false
     }
-
-    pub(crate) fn note_reactor_progress(&mut self, _progressed: bool) {}
 }
 
 impl AprAioReactor {

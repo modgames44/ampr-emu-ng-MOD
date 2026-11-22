@@ -66,9 +66,8 @@ pub struct CacheStats {
     pub pins: usize,
     pub evictable: usize,
     pub probationary: usize,
-    pub protected_entries: usize,
 }
-const _: () = assert!(core::mem::size_of::<CacheStats>() == 64);
+const _: () = assert!(core::mem::size_of::<CacheStats>() == 56);
 const _: () = assert!(core::mem::offset_of!(CacheStats, evictable) == 40);
 
 use super::pack::{ampr_pack_notify_fd_budget_progress, ampr_pack_try_open_indexed};
@@ -411,7 +410,6 @@ impl State {
             pins: self.phys_open_pins,
             evictable: self.phys_evictable,
             probationary: self.lru_len,
-            protected_entries: 0,
         }
     }
 }
@@ -792,23 +790,11 @@ unsafe fn open_indexed_or_real(
         return Err(rc);
     }
     let mut handled = false;
-    // One path buffer for both uses below (the frame stays as it was:
-    // tools/check_stack_frames.py budgets hook-path frames).
-    let mut path: EntryPath = [0; ampr_format::source::PATH_BUF];
     let fd = unsafe { ampr_pack_try_open_indexed(id, &view, flags, mode, &mut handled) };
     if handled {
-        // An APR open of a stream (readahead.rs `stream_path`): one index
-        // path read, here only, to mark the fd for read-ahead.
-        if fd >= 0 {
-            if entry(&mut view, Some(&mut path)) == 0 && !view.path.is_null() {
-                let name = unsafe {
-                    core::slice::from_raw_parts(view.path.cast::<u8>(), view.path_length as usize)
-                };
-                unsafe { super::pack::ampr_pack_mark_stream_fd(fd, name) };
-            }
-        }
         return Ok(Some(fd));
     }
+    let mut path: EntryPath = [0; ampr_format::source::PATH_BUF];
     let rc = entry(&mut view, Some(&mut path));
     if rc != 0 || view.path.is_null() {
         return Err(if rc != 0 { rc } else { -ENOENT });
@@ -837,7 +823,6 @@ unsafe fn open_indexed_or_real(
 /// path (`open_indexed_or_real`). Errors are negative POSIX errno (-EAGAIN
 /// when the caller should retry after a pin is released).
 pub unsafe fn ampr_index_acquire_cached_fd(
-    _job_id: u64,
     id: u32,
     mut entry: impl FnMut(&mut FileEntryView, Option<&mut EntryPath>) -> c_int,
     flags: c_int,

@@ -13,6 +13,7 @@ pub(crate) unsafe fn allocate_virtual_aio_locked(state: *mut PackState) -> u32 {
             reset_virtual_aio_slot(slot, generation, VirtualAioPhase::Reserved);
             slot.submit_ns = stats::now();
             (*state).virtual_aio_cursor = (index + 1) % slots;
+            (*state).virtual_aio_used += 1;
             return index;
         }
     }
@@ -29,7 +30,16 @@ pub(crate) unsafe fn free_virtual_aio_locked(state: *mut PackState, index: u32) 
     if was_fd_waiter {
         PACK_FD_WAITER_COUNT.fetch_sub(1, Ordering::SeqCst);
     }
+    unsafe { mark_virtual_aio_free_locked(state, index) };
+}
+
+/// Resets slot `index` to Free and gives its count back once (a second free
+/// of the same slot counts nothing). PACK_M held.
+pub(crate) unsafe fn mark_virtual_aio_free_locked(state: *mut PackState, index: u32) {
     let slot = &mut (*state).virtual_aio[index as usize];
+    if slot.phase != VirtualAioPhase::Free {
+        (*state).virtual_aio_used -= 1;
+    }
     let generation = slot.generation;
     reset_virtual_aio_slot(slot, generation, VirtualAioPhase::Free);
 }
@@ -181,30 +191,8 @@ pub unsafe fn ampr_pack_manifest_is_resident_ready() -> bool {
 /// Every read-only non-directory open, in both formats: a packed file has
 /// no physical copy to fall back to, so a plain `O_RDONLY` open must get a
 /// virtual fd too (an LZ4 title failed plain opens of its packed files).
-/// FreeBSD open flags a read-write open of a packed file must not carry to
-/// be served read-only (see `pack_open_flags_supported`).
-const O_RDWR: c_int = 0x2;
-const O_APPEND: c_int = 0x8;
-const O_CREAT: c_int = 0x200;
-const O_TRUNC: c_int = 0x400;
-const O_EXCL: c_int = 0x800;
-
-/// Read-only opens get a virtual fd. So does O_RDWR without O_CREAT,
-/// O_TRUNC, O_APPEND or O_EXCL: titles open data files read-write and only
-/// read them, and a packed file has no physical copy, so the physical open
-/// failed with ENOENT and the title did not start. Such an fd reads the
-/// packed bytes; a write on it fails with EBADF (the kernel does not know
-/// the virtual fd number). Any other write open stays physical (slots.rs
-/// caller).
 pub(crate) fn pack_open_flags_supported(flags: c_int) -> bool {
-    if flags & O_DIRECTORY != 0 {
-        return false;
-    }
-    match flags & O_ACCMODE {
-        O_RDONLY => true,
-        O_RDWR => flags & (O_CREAT | O_TRUNC | O_APPEND | O_EXCL) == 0,
-        _ => false,
-    }
+    (flags & O_ACCMODE) == O_RDONLY && (flags & O_DIRECTORY) == 0
 }
 
 /// What the record check of a packed open decided.
@@ -299,51 +287,6 @@ pub(crate) unsafe fn ampr_pack_try_open_indexed_impl(
         return SCE_KERNEL_ERROR_ENOENT;
     }
     allocate_virtual_fd_locked(state, file_id)
-}
-
-/// Marks virtual pack fd `fd`, just opened on `path` (bytes, no NUL), as a
-/// stream when the name is one (readahead.rs `stream_path`). The index
-/// view reads no path at open, so the caller passes the one it has: the
-/// game's spelling (rt/index.rs) or the index path (rt/fd_cache.rs).
-pub(crate) unsafe fn ampr_pack_mark_stream_fd(fd: c_int, path: &[u8]) {
-    let Some(index) = decode_virtual_fd(fd) else { return };
-    if !stream_path(path) {
-        return;
-    }
-    let state = unsafe { pack_state() };
-    let _lock = PACK_M.lock();
-    let slot = &mut (*state).virtual_fds[index as usize];
-    if slot.holds(fd) {
-        slot.stream = true;
-    }
-}
-
-/// `dup` of a virtual pack fd (rt/index.rs `dup_emul`): Some(new fd or an
-/// SCE error) for a virtual pack fd, None for any other fd. The new slot
-/// reads the same file from the old cursor; the two cursors then move
-/// apart (a kernel dup shares one offset: noted, no title seen to rely on
-/// it with packed files).
-pub(crate) unsafe fn ampr_pack_try_dup_fd(fd: c_int) -> Option<c_int> {
-    let index = decode_virtual_fd(fd)?;
-    let state = unsafe { pack_state() };
-    if WORKER_STOP_REQUESTED.load(Ordering::Acquire) {
-        return Some(SCE_KERNEL_ERROR_EBADF);
-    }
-    let _lock = PACK_M.lock();
-    if MANIFEST_READERS.is_closed() {
-        return Some(SCE_KERNEL_ERROR_EBADF);
-    }
-    let old = (*state).virtual_fds[index as usize];
-    if !old.holds(fd) {
-        return Some(SCE_KERNEL_ERROR_EBADF);
-    }
-    let new = unsafe { allocate_virtual_fd_locked(state, old.file_id) };
-    if new >= 0 {
-        let slot = (new as u32 - AMPR_EMU_PACK_VIRTUAL_FD_BASE as u32) as usize;
-        (*state).virtual_fds[slot].cursor = old.cursor;
-        (*state).virtual_fds[slot].stream = old.stream;
-    }
-    Some(new)
 }
 
 pub unsafe fn ampr_pack_try_open_indexed(

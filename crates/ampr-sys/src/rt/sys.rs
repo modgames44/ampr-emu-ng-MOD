@@ -46,11 +46,8 @@ pub const SCE_KERNEL_PROT_CPU_READ: c_int = 0x01;
 pub const SCE_KERNEL_PROT_CPU_RW: c_int = 0x02;
 pub const SCE_KERNEL_PROT_CPU_EXEC: c_int = 0x04;
 pub const SCE_KERNEL_PROT_CPU_ALL: c_int = 0x07;
-/// GPU access bits of mmap/sceKernelMmap prot, the PS4 SDK values (the
-/// ps5-payload-sdk headers do not define them); a GPU fault never reaches
-/// a CPU signal handler (rt/pack/mmap_fault.rs).
-pub const SCE_KERNEL_PROT_GPU_READ: c_int = 0x10;
-pub const SCE_KERNEL_PROT_GPU_WRITE: c_int = 0x20;
+/// AMPR prot bits, the PS4 SDK values (the ps5-payload-sdk headers do not
+/// define them).
 pub const SCE_KERNEL_PROT_AMPR_WRITE: c_int = 0x80;
 pub const SCE_KERNEL_PROT_AMPR_ALL: c_int = 0xc0;
 
@@ -362,7 +359,7 @@ unsafe extern "C" {
     ) -> c_int;
 
     // libc (LIBC_IMPORTS). Prefer core::ptr for copies; these are for parity.
-    // Only the global allocator (lib.rs, non-test) calls these two.
+    // Only the global allocator (rt/heap.rs, non-test) calls these two.
     #[cfg(not(test))]
     pub fn malloc(size: usize) -> *mut c_void;
     #[cfg(not(test))]
@@ -435,13 +432,13 @@ pub mod hook {
     pub const fcntl: usize = 93;
     pub const _fcntl: usize = 94;
     pub const sceKernelFcntl: usize = 95;
-    // Both formats, Makefile `AMPR_ZSTD_MMAP` != 0: mmap of a virtual pack fd
-    // maps a disk cache copy of the packed file (rt/pack/mmap.rs). Both
-    // builds.
+    // Debug builds only: pass-through probes of a map of a packed file,
+    // which fails (rt/probe.rs). Release never installs them; they held the
+    // removed mmap disk cache. Kept so the later ids keep their numbers.
     pub const mmap: usize = 96;
     pub const sceKernelMmap: usize = 97;
-    // `AMPR_ZSTD_MMAP` == 1: munmap unregisters decode-on-fault mappings
-    // (rt/pack/mmap.rs). Both builds.
+    // Unused, never installed: they held the munmap hooks of decode on
+    // access, which was removed. Kept so the later ids keep their numbers.
     pub const munmap: usize = 98;
     pub const sceKernelMunmap: usize = 99;
     // 100..=109: the game's own kernel AIO, both formats, both builds: a
@@ -463,29 +460,28 @@ pub mod hook {
     // (rt/thread_hooks.rs).
     pub const scePthreadCreate: usize = 110;
     pub const pthread_create: usize = 111;
-    // 112..=115: both builds, titles with packs: the *at path calls and
-    // dup, routed through the index and the virtual fds (rt/index.rs
-    // `openat_emul` .. `dup_emul`). The exported `openat`/`fstatat`/
-    // `faccessat` do not go through `_openat`/`stat`/`access`, so a packed
-    // file opened or probed with them was missing.
-    pub const openat: usize = 112;
-    pub const fstatat: usize = 113;
-    pub const faccessat: usize = 114;
-    pub const dup: usize = 115;
-    // 116..=119: debug-only pass-through probes of fully packed games, both
+    // 112..=119: debug-only pass-through probes of fully packed games, both
     // formats (rt/probe.rs); release builds have no such slots.
     #[cfg(feature = "mem_report")]
-    pub const dup2: usize = 116;
+    pub const dup: usize = 112;
     #[cfg(feature = "mem_report")]
-    pub const poll: usize = 117;
+    pub const dup2: usize = 113;
     #[cfg(feature = "mem_report")]
-    pub const select: usize = 118;
+    pub const poll: usize = 114;
+    #[cfg(feature = "mem_report")]
+    pub const select: usize = 115;
+    #[cfg(feature = "mem_report")]
+    pub const openat: usize = 116;
+    #[cfg(feature = "mem_report")]
+    pub const fstatat: usize = 117;
+    #[cfg(feature = "mem_report")]
+    pub const faccessat: usize = 118;
     #[cfg(feature = "mem_report")]
     pub const readlink: usize = 119;
     #[cfg(feature = "mem_report")]
     pub const COUNT: usize = 120;
     #[cfg(not(feature = "mem_report"))]
-    pub const COUNT: usize = 116;
+    pub const COUNT: usize = 112;
 }
 
 /// Original (pre-detour) libkernel entry points, indexed by `hook::*`, and
@@ -545,6 +541,114 @@ impl LazySym {
             unsafe { fn_from_ptr(v as *mut c_void) }
         }
     }
+}
+
+// ---- memory mapping queries ----
+
+/// One `sceKernelQueryMemoryProtection` answer for an address.
+pub(crate) struct MemoryMapping {
+    pub rc: c_int,
+    pub start: usize,
+    pub end: usize,
+    pub prot: c_int,
+}
+
+impl MemoryMapping {
+    /// The mapping's end, exclusive. Answers use that form, but a core dump's
+    /// VMEM record uses the inclusive one (an end inside a page), so both are
+    /// accepted (pack/virtual_read.rs).
+    pub(crate) fn end_exclusive(&self) -> usize {
+        if self.end & (SCE_KERNEL_PAGE_SIZE - 1) == 0 {
+            self.end
+        } else {
+            self.end.saturating_add(1)
+        }
+    }
+
+    /// The answered query puts `addr` in this mapping with `need` protection.
+    pub(crate) fn contains(&self, addr: usize, need: c_int) -> bool {
+        self.rc == 0 && self.start <= addr && addr < self.end_exclusive() && self.prot & need != 0
+    }
+}
+
+static QUERY_PROT: LazySym = LazySym::new(c"sceKernelQueryMemoryProtection");
+type QueryProtFn =
+    unsafe extern "C" fn(*mut c_void, *mut *mut c_void, *mut *mut c_void, *mut c_int) -> c_int;
+
+/// Whether libkernel has `sceKernelQueryMemoryProtection`. Resolved once.
+pub(crate) fn memory_query_available() -> bool {
+    unsafe { QUERY_PROT.get::<QueryProtFn>() }.is_some()
+}
+
+/// The mapping of `addr`, or None when libkernel lacks the query. A refused
+/// query (EACCES) is an answer too: `rc` carries it.
+pub(crate) fn query_memory_mapping(addr: usize) -> Option<MemoryMapping> {
+    let query = unsafe { QUERY_PROT.get::<QueryProtFn>() }?;
+    let (mut start, mut end, mut prot) = (core::ptr::null_mut(), core::ptr::null_mut(), 0);
+    let rc = unsafe { query(addr as *mut c_void, &mut start, &mut end, &mut prot) };
+    Some(MemoryMapping {
+        rc,
+        start: start as usize,
+        end: end as usize,
+        prot,
+    })
+}
+
+/// Probe address for `query_protection_is_blind`: this runtime's own .bss,
+/// mapped CPU-writable by definition.
+static BLIND_PROBE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// True when the query refuses a known-mapped address. EACCES then says
+/// nothing about the target. Decided once; false without the symbol.
+pub(crate) fn query_protection_is_blind() -> bool {
+    use core::sync::atomic::Ordering;
+    let seen = BLIND_PROBE.load(Ordering::Relaxed);
+    if seen != 0 {
+        return seen == 2;
+    }
+    let blind = query_memory_mapping(&BLIND_PROBE as *const _ as usize)
+        .is_some_and(|m| m.rc == SCE_KERNEL_ERROR_EACCES);
+    BLIND_PROBE.store(if blind { 2 } else { 1 }, Ordering::Relaxed);
+    blind
+}
+
+/// Probe address for `eacces_is_unmapped`: the null page, which no PS5
+/// process maps (the eboot loads at 0x400000).
+const UNMAPPED_PROBE: usize = 0x1000;
+
+static EACCES_IS_UNMAPPED: core::sync::atomic::AtomicU8 =
+    core::sync::atomic::AtomicU8::new(0);
+
+/// Whether the query also answers EACCES for a known-unmapped address,
+/// which would make an EACCES WaitOnAddress target indistinguishable from an
+/// unmapped one. Asked once, when the first EACCES target arrives, and
+/// published as the debug `apr_address_eacces_unmapped` counter (1) and a
+/// `b'a'` black-box line. The waits go ahead either way
+/// (reactor/software.rs `address_query_allows`).
+pub(crate) fn eacces_is_unmapped() -> bool {
+    use core::sync::atomic::Ordering;
+    let seen = EACCES_IS_UNMAPPED.load(Ordering::Relaxed);
+    if seen != 0 {
+        return seen == 2;
+    }
+    let answer = query_memory_mapping(UNMAPPED_PROBE);
+    let unmapped = answer
+        .as_ref()
+        .is_some_and(|m| m.rc == SCE_KERNEL_ERROR_EACCES);
+    EACCES_IS_UNMAPPED.store(if unmapped { 2 } else { 1 }, Ordering::Relaxed);
+    if let Some(mapping) = answer {
+        super::stats::apr_call_error(
+            b'a',
+            mapping.rc as i64,
+            b"addr-probe unmapped-rc=",
+            mapping.rc as u64,
+            b"",
+        );
+    }
+    if unmapped {
+        super::stats::add(super::stats::Stat::AprAddressEaccesUnmapped, 1);
+    }
+    unmapped
 }
 
 /// Crash like `std::abort()` without a plain libc import.
@@ -794,13 +898,8 @@ unsafe extern "C" {
     pub fn sceKernelDeleteEqueue();
     pub fn sceKernelAddAmprEvent();
     pub fn sceKernelDeleteAmprEvent();
-    pub fn sceKernelAddTimerEvent();
-    pub fn sceKernelAddReadEvent();
-    pub fn sceKernelAddWriteEvent();
-    pub fn sceKernelAddFileEvent();
-    pub fn sceKernelAddUserEvent();
+    /// The equeue's hidden wake (rt/equeue.rs).
     pub fn sceKernelAddUserEventEdge();
-    pub fn sceKernelAddHRTimerEvent();
 }
 
 // ---- libkernel imports for rt/index.rs --------------------------------------

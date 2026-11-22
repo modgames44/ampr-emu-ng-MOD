@@ -122,27 +122,157 @@ pub(crate) fn list_next_in<S: Source + ?Sized>(
     Ok(Some(ViewChild { len, kind, next }))
 }
 
-/// `list_next_in` over the published view; None before the mount is ready.
-pub(crate) fn list_next(c: Cursor, name: &mut [u8; 256]) -> ampr_format::Result<Option<ViewChild>> {
-    match listing_view() {
-        Some((view, paths)) => list_next_in(&view, paths, c, name),
-        None => Ok(None),
+// ---- listing window ---------------------------------------------------------
+//
+// A listed name is read from the stored path (`list_next_in`), one
+// PATH_BUF read per entry: on the kept index fd that was one 1 KiB pread
+// per entry. A getdents call reads its names through one 64 KiB window
+// instead, so the entries of one directory, whose paths sit together in
+// the blob of a sorted index, cost about one pread per 64 KiB of paths.
+// The window is one buffer for the module, taken by one getdents at a
+// time; a call that finds it busy, or a title whose index has no room
+// for it, reads per entry as before.
+
+/// Bytes of the listing window, as the index build windows.
+const LISTING_WINDOW: usize = crate::rt::index_file::WINDOW;
+
+/// The window buffer once taken from the Index ledger, null before.
+static LISTING_BUF: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
+/// 0 untried, 1 taken (in `LISTING_BUF`), 2 refused for good.
+static LISTING_STATE: AtomicU8 = AtomicU8::new(0);
+/// Held by the getdents call reading through the window.
+static LISTING_BUSY: AtomicBool = AtomicBool::new(false);
+
+/// `src` read through `win` when there is one: a read inside the window
+/// copies from it, any other refills it with up to `win.len()` bytes
+/// around the read, placed after it when the reads move forward and
+/// before it when they move back (a packed chain lists ids downward).
+/// The window is valid for one getdents call: the index file does not
+/// change under it.
+pub(crate) struct Windowed<'a, S: Source + ?Sized> {
+    src: &'a S,
+    win: Option<core::cell::RefCell<&'a mut [u8]>>,
+    base: core::cell::Cell<u64>,
+    filled: core::cell::Cell<usize>,
+    last: core::cell::Cell<u64>,
+}
+
+impl<'a, S: Source + ?Sized> Windowed<'a, S> {
+    pub(crate) fn new(src: &'a S, win: Option<&'a mut [u8]>) -> Self {
+        Self {
+            src,
+            win: win.map(core::cell::RefCell::new),
+            base: core::cell::Cell::new(0),
+            filled: core::cell::Cell::new(0),
+            last: core::cell::Cell::new(0),
+        }
     }
 }
 
-/// The child at the slot's view cursor (`list_next`) and the cursor after it in `next`.
-/// `Ok(false)` at the end of the listing (`next` is `Done`) or for an
-/// entry whose name cannot be listed (skipped); `Err(IndexIo)` when its
-/// path could not be read (the cursor stays).
-fn next_view_child(
+impl<S: Source + ?Sized> Source for Windowed<'_, S> {
+    fn len(&self) -> u64 {
+        self.src.len()
+    }
+
+    fn read_at(&self, at: u64, out: &mut [u8]) -> ampr_format::Result<()> {
+        let Some(win) = &self.win else {
+            return self.src.read_at(at, out);
+        };
+        let mut win = win.borrow_mut();
+        let len = self.src.len();
+        let end = at
+            .checked_add(out.len() as u64)
+            .filter(|&e| e <= len)
+            .ok_or(ampr_format::Error::Truncated)?;
+        if out.len() > win.len() {
+            return self.src.read_at(at, out);
+        }
+        let (base, filled) = (self.base.get(), self.filled.get() as u64);
+        if !(base <= at && end <= base + filled) {
+            let size = win.len() as u64;
+            let back = at < self.last.get();
+            let start = if back { end.saturating_sub(size) } else { at };
+            // Keep a full window where the file allows it.
+            let start = start.min(len.saturating_sub(size));
+            let n = (len - start).min(size) as usize;
+            self.filled.set(0);
+            self.src.read_at(start, &mut win[..n])?;
+            self.base.set(start);
+            self.filled.set(n);
+        }
+        let off = (at - self.base.get()) as usize;
+        out.copy_from_slice(&win[off..off + out.len()]);
+        self.last.set(at);
+        Ok(())
+    }
+}
+
+/// The listing window for this call, None when another call holds it or
+/// it could not be taken. Given back by `ListingGuard`.
+fn take_listing_window() -> Option<&'static mut [u8]> {
+    if LISTING_BUSY
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        return None;
+    }
+    if LISTING_STATE.load(Ordering::Acquire) == 0 {
+        // Only from the kept room: a refusal here must not raise the
+        // index notice (`index_alloc` does on a cap refusal).
+        let p = if crate::rt::index_memory::index_room() >= LISTING_WINDOW {
+            unsafe {
+                crate::rt::index_memory::index_alloc(
+                    LISTING_WINDOW,
+                    SCE_KERNEL_PAGE_SIZE,
+                    c"apr.list.window".as_ptr(),
+                )
+            }
+        } else {
+            core::ptr::null_mut()
+        };
+        LISTING_BUF.store(p, Ordering::Release);
+        LISTING_STATE.store(if p.is_null() { 2 } else { 1 }, Ordering::Release);
+    }
+    let p = LISTING_BUF.load(Ordering::Acquire);
+    if p.is_null() {
+        LISTING_BUSY.store(false, Ordering::Release);
+        return None;
+    }
+    // SAFETY: `LISTING_BUSY` gives one caller the buffer at a time, and it
+    // is never freed.
+    Some(unsafe { core::slice::from_raw_parts_mut(p, LISTING_WINDOW) })
+}
+
+/// Gives the window back when the getdents call returns, on every path.
+struct ListingGuard(bool);
+
+impl Drop for ListingGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            LISTING_BUSY.store(false, Ordering::Release);
+        }
+    }
+}
+
+/// The child at the slot's view cursor (`list_next_in` over `listing`,
+/// the published view and its path source) and the cursor after it in
+/// `next`. `Ok(false)` at the end of the listing (`next` is `Done`), with
+/// no view, or for an entry whose name cannot be listed (skipped);
+/// `Err(IndexIo)` when its path could not be read (the cursor stays).
+fn next_view_child<S: Source + ?Sized>(
     slot: &VirtualDirectorySlot,
+    listing: Option<(&View<'_>, &S)>,
     name: &mut [u8; 256],
     name_length: &mut u8,
     type_: &mut u8,
     next: &mut Cursor,
 ) -> Result<bool, IndexIo> {
     *next = slot.listing;
-    let child = match list_next(slot.listing, name) {
+    let read = match listing {
+        Some((view, src)) => list_next_in(view, src, slot.listing, name),
+        None => Ok(None),
+    };
+    let child = match read {
         Ok(Some(child)) => child,
         Err(ampr_format::Error::Io) => return Err(IndexIo),
         Ok(None) | Err(_) => {
@@ -233,6 +363,18 @@ pub(crate) fn directory_open_flags(flags: c_int) -> bool {
     flags & O_DIRECTORY != 0 || flags & O_ACCMODE == O_RDONLY
 }
 
+/// Whether a plain read-only open of a directory that exists on disk may
+/// answer with the kernel's fd and its own entries: only in a title with no
+/// packs. With packs, packed entries may sit below any existing directory.
+/// A game that walks `/app0` with flags 0 at boot and later looks files up
+/// only among the names it listed fails on every packed file, and that
+/// lookup makes no filesystem call, so no trace or `/fsfail` line shows it.
+/// The merge below still answers from the kernel fd (`fallback`) when
+/// nothing is packed below the directory.
+fn plain_physical_fd_answers(flags: c_int, real_fd: c_int, packs: bool) -> bool {
+    flags & O_DIRECTORY == 0 && real_fd >= 0 && !packs
+}
+
 #[inline(never)]
 pub(crate) unsafe fn ampr_pack_open_directory_impl(
     path: *const c_char,
@@ -264,8 +406,10 @@ pub(crate) unsafe fn ampr_pack_open_directory_impl(
         }
         // A plain read-only open of a directory that really is on disk (a
         // folder install) keeps the kernel's fd and its own entries; only a
-        // missing directory is served from the index.
-        if allow_physical_open && flags & O_DIRECTORY == 0 && real_fd >= 0 {
+        // missing directory is served from the index. A title with packs
+        // goes on to the merge instead, so packed entries below an existing
+        // directory are listed too (`plain_physical_fd_answers`).
+        if allow_physical_open && plain_physical_fd_answers(flags, real_fd, packs_present()) {
             return real_fd;
         }
         if allow_physical_open && real_fd < 0 {
@@ -479,8 +623,8 @@ pub unsafe fn ampr_pack_is_virtual_directory_fd(fd: c_int) -> bool {
 
 /// Copies the path of an open virtual directory fd into `out` (truncated,
 /// NUL-terminated) and returns its length; None for any other fd. Debug
-/// probes (rt/probe.rs) log it so `/fsfail` dedups by directory; the *at
-/// hooks (rt/index.rs `at_path`) join a relative path to it.
+/// probes (rt/probe.rs) log it so `/fsfail` dedups by directory.
+#[cfg(feature = "mem_report")]
 pub(crate) unsafe fn virtual_directory_fd_path(fd: c_int, out: &mut [u8]) -> Option<usize> {
     if out.is_empty() {
         return None;
@@ -684,22 +828,50 @@ fn physical_dirent_bounds(rest: &[u8]) -> Option<(usize, usize)> {
     Some((record_size, name_length))
 }
 
-/// Ends a synthetic batch of `result` bytes: reports `synthetic_base` and
-/// advances the slot's directory offset past it.
-fn finish_synthetic(
+/// Where the bytes of one getdents batch came from: the directory offset
+/// of its first physical record, if it starts with physical records, and
+/// the offset and buffer position where its synthetic records start.
+#[derive(Clone, Copy)]
+struct Batch {
+    physical_base: Option<c_long>,
+    synthetic_base: c_long,
+    synthetic_start: usize,
+}
+
+/// Ends a batch of `output` bytes: reports the batch's base (its first
+/// physical record's, else the synthetic one) and advances the slot's
+/// directory offset past the synthetic records. The physical reads already
+/// moved it past theirs.
+fn finish_batch(
     slot: &mut VirtualDirectorySlot,
     basep: *mut c_long,
-    synthetic_base: c_long,
-    result: c_int,
+    batch: Batch,
+    output: usize,
 ) -> c_int {
-    if result >= 0 {
-        if !basep.is_null() {
-            unsafe { *basep = synthetic_base };
-        }
-        slot.directory_offset = overlay::advance_offset(synthetic_base, result);
+    if !basep.is_null() {
+        unsafe { *basep = batch.physical_base.unwrap_or(batch.synthetic_base) };
     }
-    result
+    let synthetic = (output - batch.synthetic_start) as c_int;
+    slot.directory_offset = overlay::advance_offset(batch.synthetic_base, synthetic);
+    output as c_int
 }
+
+/// Ends a batch of `output` bytes of physical records only, before the
+/// physical directory ended: reports the base of its first record. Each
+/// physical read already moved the slot's directory offset.
+fn finish_physical(basep: *mut c_long, physical_base: Option<c_long>, output: usize) -> c_int {
+    if let Some(base) = physical_base {
+        if !basep.is_null() {
+            unsafe { *basep = base };
+        }
+    }
+    output as c_int
+}
+
+/// Smallest room left in the caller's buffer that a physical read tops up
+/// after the first: FreeBSD's DIRBLKSIZ. A filesystem that wants more
+/// refuses the read, and the batch ends with what it holds.
+const PHYSICAL_TOP_UP_MIN: usize = 512;
 
 /// Emits the `.` or `..` entry once (`emitted`); 0, or the emit error.
 unsafe fn emit_dot(
@@ -871,19 +1043,38 @@ unsafe fn directory_read_fd(
             return SCE_KERNEL_ERROR_EBADF;
         }
 
+        // Like the kernel's, one call fills the buffer: physical records
+        // first, then, once the physical directory has ended, the packed
+        // ones. A batch that stopped after the physical records made a
+        // title that reads a directory with one getdents never see a
+        // packed file: Marvel's Avengers lists /app0 once for its `.nfo`
+        // archive files, found none, and died on a divide by zero at boot.
+        let mut output = 0usize;
+        let mut batch_physical_base: Option<c_long> = None;
         while !slot.real_exhausted && slot.real_fd >= 0 {
+            let room = size as usize - output;
+            if output != 0 && room < PHYSICAL_TOP_UP_MIN {
+                return finish_physical(basep, batch_physical_base, output);
+            }
+            let target = buffer.add(output);
             let mut physical_base = slot.directory_offset;
             let rc = if use_getdirentries {
                 let Some(f) = getdirentries_fn else {
                     return SCE_KERNEL_ERROR_EIO;
                 };
-                f(slot.real_fd, buffer, size, &mut physical_base)
+                f(slot.real_fd, target, room as c_int, &mut physical_base)
             } else {
                 let Some(f) = getdents_fn else {
                     return SCE_KERNEL_ERROR_EIO;
                 };
-                f(slot.real_fd, buffer, size)
+                f(slot.real_fd, target, room as c_int)
             };
+            // A top-up read that fails consumed nothing: the batch ends
+            // with what it holds and the next call reads with the whole
+            // buffer, where the failure is handled below.
+            if rc < 0 && output != 0 {
+                return finish_physical(basep, batch_physical_base, output);
+            }
             if rc < 0 {
                 let errno = open_failure_errno(rc);
                 if !physical_getdents_failure_is_final(errno) {
@@ -916,15 +1107,19 @@ unsafe fn directory_read_fd(
             slot.dot_emitted = true;
             slot.dot_dot_emitted = true;
             let total = rc as usize;
+            let start = output;
             let mut input = 0usize;
-            let mut output = 0usize;
             while input < total {
                 let rest =
-                    core::slice::from_raw_parts(buffer.add(input) as *const u8, total - input);
+                    core::slice::from_raw_parts(target.add(input) as *const u8, total - input);
                 let Some((record_size, name_length)) = physical_dirent_bounds(rest) else {
-                    return SCE_KERNEL_ERROR_EIO;
+                    return if start == 0 {
+                        SCE_KERNEL_ERROR_EIO
+                    } else {
+                        finish_physical(basep, batch_physical_base, start)
+                    };
                 };
-                let d_name = buffer.add(input + DIRENT_NAME_OFFSET) as *const c_char;
+                let d_name = target.add(input + DIRENT_NAME_OFFSET) as *const c_char;
                 let hidden = service_name_hidden(
                     state,
                     slot.path.as_ptr(),
@@ -934,23 +1129,23 @@ unsafe fn directory_read_fd(
                 );
                 if !hidden {
                     directory_record_physical_name(slot, d_name, name_length);
-                    if output != input {
-                        core::ptr::copy(buffer.add(input), buffer.add(output), record_size);
+                    if output != start + input {
+                        core::ptr::copy(target.add(input), buffer.add(output), record_size);
                     }
                     output += record_size;
                 }
                 input += record_size;
             }
-            if output != 0 {
-                if !basep.is_null() {
-                    *basep = physical_base;
-                }
-                return output as c_int;
+            if output != start && batch_physical_base.is_none() {
+                batch_physical_base = Some(physical_base);
             }
         }
 
-        let mut output = 0usize;
-        let synthetic_base = slot.directory_offset;
+        let batch = Batch {
+            physical_base: batch_physical_base,
+            synthetic_base: slot.directory_offset,
+            synthetic_start: output,
+        };
         // A physical directory lists `.` and `..` itself; with none, or one
         // that failed to list, they come from here.
         if slot.real_fd < 0 || slot.real_failed {
@@ -965,7 +1160,7 @@ unsafe fn directory_read_fd(
                     return if output == 0 {
                         dot_rc
                     } else {
-                        finish_synthetic(slot, basep, synthetic_base, output as c_int)
+                        finish_batch(slot, basep, batch, output)
                     };
                 }
             }
@@ -973,6 +1168,17 @@ unsafe fn directory_read_fd(
 
         // The slot path is fixed while the slot is open: hash it once.
         let path_hash = folded_hash(slot.path.as_ptr(), slot.path_length as usize);
+        // One view and one path source for the call; names on the kept
+        // index fd go through the listing window (a resident blob needs none).
+        let view = listing_view();
+        let window = match view {
+            Some((_, crate::rt::index::Paths::File(_))) if slot.listing != Cursor::Done => {
+                take_listing_window()
+            }
+            _ => None,
+        };
+        let _guard = ListingGuard(window.is_some());
+        let src = view.map(|(v, paths)| (v, Windowed::new(paths, window)));
         while slot.listing != Cursor::Done {
             let mut name = [0u8; 256];
             let mut name_length = 0u8;
@@ -980,6 +1186,7 @@ unsafe fn directory_read_fd(
             let mut next_listing = slot.listing;
             let child = next_view_child(
                 slot,
+                src.as_ref().map(|(v, w)| (v, w)),
                 &mut name,
                 &mut name_length,
                 &mut type_,
@@ -998,7 +1205,7 @@ unsafe fn directory_read_fd(
                     return if output == 0 {
                         SCE_KERNEL_ERROR_EIO
                     } else {
-                        finish_synthetic(slot, basep, synthetic_base, output as c_int)
+                        finish_batch(slot, basep, batch, output)
                     };
                 }
             }
@@ -1040,13 +1247,13 @@ unsafe fn directory_read_fd(
                 return if output == 0 {
                     rc
                 } else {
-                    finish_synthetic(slot, basep, synthetic_base, output as c_int)
+                    finish_batch(slot, basep, batch, output)
                 };
             }
             output += rc as usize;
             slot.listing = next_listing;
         }
-        finish_synthetic(slot, basep, synthetic_base, output as c_int)
+        finish_batch(slot, basep, batch, output)
     }
 }
 
@@ -1073,6 +1280,70 @@ mod tests {
         assert_eq!(physical_dirent_bounds(&record(16, 8, 16)), None);
         assert_eq!(physical_dirent_bounds(&record(24, 3, 16)), None);
         assert_eq!(physical_dirent_bounds(&record(8, 0, 16)), None);
+    }
+
+    /// A slice source counting its reads, as the kept fd's preads.
+    struct Counting(Vec<u8>, core::cell::Cell<u32>);
+
+    impl Source for Counting {
+        fn len(&self) -> u64 {
+            self.0.len() as u64
+        }
+        fn read_at(&self, at: u64, out: &mut [u8]) -> ampr_format::Result<()> {
+            self.1.set(self.1.get() + 1);
+            self.0[..].read_at(at, out)
+        }
+    }
+
+    /// The window answers what the source would, with one source read per
+    /// window of bytes in either direction; a read longer than the window
+    /// or with no window goes straight to the source.
+    #[test]
+    fn listing_window_reads_each_block_once_both_ways() {
+        let bytes: Vec<u8> = (0..1000u32).map(|i| (i * 31 + i / 7) as u8).collect();
+        let src = Counting(bytes.clone(), Default::default());
+        let mut win = [0u8; 100];
+        let w = Windowed::new(&src, Some(&mut win[..]));
+        let mut out = [0u8; 10];
+        for at in (0..990).step_by(10) {
+            w.read_at(at, &mut out).unwrap();
+            assert_eq!(out[..], bytes[at as usize..at as usize + 10]);
+        }
+        assert_eq!(src.1.get(), 10);
+        src.1.set(0);
+        let w = Windowed::new(&src, Some(&mut win[..]));
+        w.read_at(985, &mut out[..5]).unwrap();
+        for at in (0..98u64).rev().map(|i| i * 10) {
+            w.read_at(at, &mut out).unwrap();
+            assert_eq!(out[..], bytes[at as usize..at as usize + 10]);
+        }
+        assert_eq!(src.1.get(), 10);
+        // Past the end, longer than the window, and no window at all.
+        assert_eq!(w.read_at(995, &mut out), Err(ampr_format::Error::Truncated));
+        let mut long = [0u8; 150];
+        src.1.set(0);
+        w.read_at(800, &mut long).unwrap();
+        assert_eq!(long[..], bytes[800..950]);
+        let direct = Windowed::new(&src, None);
+        direct.read_at(3, &mut out).unwrap();
+        direct.read_at(4, &mut out).unwrap();
+        assert_eq!(src.1.get(), 3);
+        assert_eq!(out[..], bytes[4..14]);
+    }
+
+    /// A plain read-only open of an existing directory answers with the
+    /// kernel's fd only without packs: with packs the listing must merge
+    /// the packed entries below it, so the open goes on to the overlay. An
+    /// `O_DIRECTORY` open always did.
+    #[test]
+    fn plain_physical_fd_only_without_packs() {
+        assert!(plain_physical_fd_answers(0, 3, false));
+        assert!(plain_physical_fd_answers(O_RDONLY, 3, false));
+        assert!(!plain_physical_fd_answers(0, 3, true));
+        assert!(!plain_physical_fd_answers(0, -1, false));
+        assert!(!plain_physical_fd_answers(O_DIRECTORY, 3, false));
+        // A writable open never reaches the check: the impl answers it with
+        // the physical fd first (`O_ACCMODE != O_RDONLY`).
     }
 
     /// A physical `getdents` that fails for good ends the physical

@@ -46,13 +46,12 @@ pub(crate) fn apr_adaptive_direct_fd_cap(
     cap
 }
 
-pub(crate) fn apr_update_read_desc_fd_policy(rd: &mut AprAioReadDesc, promoteFullFile: bool) {
+pub(crate) fn apr_update_read_desc_fd_policy(rd: &mut AprAioReadDesc) {
     if !rd.fileMetadataValid {
         return;
     }
     rd.bypassFdCache =
-        apr_read_is_single_quantum_full_file(rd.offset, rd.length, rd.fileSize as u64)
-            && !promoteFullFile;
+        apr_read_is_single_quantum_full_file(rd.offset, rd.length, rd.fileSize as u64);
 }
 
 /// The file index entry of `rd` for an open: a desc keeps no path of its
@@ -87,7 +86,7 @@ fn apr_read_desc_entry_error(rd: &AprAioReadDesc, rc: c_int) -> c_int {
 }
 
 pub(crate) fn apr_acquire_aio_read_desc(
-    jobId: u64,
+    _jobId: u64,
     rd: &mut AprAioReadDesc,
     allowNewFd: bool,
     directOpenCap: usize,
@@ -176,6 +175,11 @@ pub(crate) fn apr_acquire_aio_read_desc(
         if fd == -1 {
             fd = ampr_sce_errno_from_posix(errno());
         }
+        if fd < 0 {
+            // 'L', as the cached open logs it (rt/fd_cache.rs): without it
+            // the black box named no file for a failed single-read open.
+            crate::rt::stats::fs_event(b'L', b'h', fd as i64, directEntry.path);
+        }
         let openErrno = if fd < 0 {
             ampr_posix_errno_from_sce(fd)
         } else {
@@ -212,8 +216,7 @@ pub(crate) fn apr_acquire_aio_read_desc(
         lookupFailed = rc != 0 && rc != -EIO;
         rc
     };
-    let fd =
-        unsafe { ampr_index_acquire_cached_fd(jobId, rd.fileId, entry, kAprAioOpenFlags, 0, true) };
+    let fd = unsafe { ampr_index_acquire_cached_fd(rd.fileId, entry, kAprAioOpenFlags, 0, true) };
     if lookupFailed {
         set_rc(apr_file_id_lookup_error(rd.fileId));
         return false;
@@ -413,13 +416,6 @@ impl AprAioReactor {
             return SCE_KERNEL_ERROR_EBUSY;
         }
         waitSlot.waiterClaimed = true;
-        if !waitSlot.ownerJob.is_null() {
-            unsafe {
-                (*waitSlot.ownerJob)
-                    .schedulingWaiterClaimed
-                    .store(true, Ordering::Release)
-            };
-        }
         let laneIndex = waitSlot.prioIndex as usize;
         self.reactorWakeEpoch.fetch_add(1, Ordering::Release);
         self.reactorCv.notify_one();

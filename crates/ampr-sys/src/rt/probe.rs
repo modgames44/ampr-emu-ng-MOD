@@ -3,7 +3,7 @@
 //! the fakelib packed): they show on a console which file APIs the runtime
 //! does not serve a game uses on packed files (dup, poll, openat, ...).
 //! Each calls its own original libkernel entry point (`sys::kernel_slot`,
-//! as rt/pack/zstd_libc.rs does) and never changes the result; it only
+//! as rt/pack/pack_libc.rs does) and never changes the result; it only
 //! logs through `stats::fs_note`, so `/fsfail` lists each distinct
 //! (op, file) once. The op letters are documented at
 //! `FsEvents` in rt/stats.rs. Built only with `mem_report`; rt/hook.rs
@@ -11,8 +11,8 @@
 //! (rt/pack/aio.rs) log their served packed requests through
 //! `note_aio_submit`, and rt/index.rs
 //! calls `probe_path` from the libc path hooks it installs as observers.
-//! rt/pack/mmap.rs logs its b'X'/b'Y' events through `fd_path` and
-//! `event_text`.
+//! Slots 96 and 97 (mmap, sceKernelMmap) are probes too, debug only: a
+//! packed file has no physical copy, so a map of one fails.
 
 use super::index::{probe_file_path, probe_packed_path};
 use super::pack::{
@@ -102,8 +102,8 @@ pub(crate) fn note_text(op: u8, how: u8, rc: i64, call: &[u8], t: &Text) {
 }
 
 /// As `note_text`, through `stats::fs_event`: only a failure (rc < 0) enters
-/// `/fsfail` (rt/pack/mmap.rs, whose served maps are counted instead).
-pub(crate) fn event_text(op: u8, how: u8, rc: i64, call: &[u8], t: &Text) {
+/// `/fsfail` (the mmap probes; every map is counted in `mmap_virtual`).
+fn event_text(op: u8, how: u8, rc: i64, call: &[u8], t: &Text) {
     stats::fs_event(op, how, rc, t.prefixed(call).ptr());
 }
 
@@ -144,7 +144,18 @@ pub(crate) unsafe fn note_aio_submit(
 
 // ---- dup, poll, select --------------------------------------------------------
 
+type DupFn = unsafe extern "C" fn(c_int) -> c_int;
 type Dup2Fn = unsafe extern "C" fn(c_int, c_int) -> c_int;
+
+pub(crate) unsafe extern "C" fn dup_probe(fd: c_int) -> c_int {
+    let seen = unsafe { fd_path(fd) };
+    let rc = unsafe { kernel_slot::<DupFn>(sys::hook::dup) }
+        .map_or_else(posix_missing_original, |f| unsafe { f(fd) });
+    if let Some(t) = seen {
+        note_text(b'D', HOW_VIRTUAL, rc.into(), b"dup", &t);
+    }
+    rc
+}
 
 pub(crate) unsafe extern "C" fn dup2_probe(fd: c_int, fd2: c_int) -> c_int {
     let seen = unsafe { fd_path(fd).or_else(|| fd_path(fd2)) };
@@ -233,6 +244,89 @@ fn select_text(nfds: c_int) -> Text {
     t
 }
 
+// ---- mmap ---------------------------------------------------------------------
+
+const MAP_FAILED: *mut c_void = usize::MAX as *mut c_void;
+/// FreeBSD MAP_ANON: the fd is not mapped (it is -1 by convention, but the
+/// kernel ignores it), so the map is never a packed file's.
+const MAP_ANON: c_int = 0x1000;
+
+type MmapFn = unsafe extern "C" fn(*mut c_void, usize, c_int, c_int, c_int, sys::off_t) -> *mut c_void;
+type SceMmapFn = unsafe extern "C" fn(
+    *mut c_void,
+    usize,
+    c_int,
+    c_int,
+    c_int,
+    sys::off_t,
+    *mut *mut c_void,
+) -> c_int;
+
+/// The path of a mapped virtual pack fd or directory, a packed file's map
+/// counted in `mmap_virtual`; None for MAP_ANON and any other fd, which
+/// pass through unlogged.
+unsafe fn map_path(flags: c_int, fd: c_int) -> Option<Text> {
+    if flags & MAP_ANON != 0 {
+        return None;
+    }
+    let t = unsafe { fd_path(fd) }?;
+    if unsafe { virtual_fd_file_id(fd) }.is_some() {
+        stats::add(stats::Stat::MmapVirtual, 1);
+    }
+    Some(t)
+}
+
+/// mmap: the original call, its result unchanged. A map of a virtual pack
+/// fd fails there and shows in `/fsfail` as op b'X'.
+pub(crate) unsafe extern "C" fn mmap_probe(
+    addr: *mut c_void,
+    len: usize,
+    prot: c_int,
+    flags: c_int,
+    fd: c_int,
+    off: sys::off_t,
+) -> *mut c_void {
+    let seen = unsafe { map_path(flags, fd) };
+    let p = match unsafe { kernel_slot::<MmapFn>(sys::hook::mmap) } {
+        Some(f) => unsafe { f(addr, len, prot, flags, fd, off) },
+        None => {
+            sys::set_errno(sys::EIO);
+            MAP_FAILED
+        }
+    };
+    if let Some(t) = seen {
+        let rc = if p == MAP_FAILED {
+            -i64::from(sys::errno())
+        } else {
+            0
+        };
+        event_text(b'X', HOW_VIRTUAL, rc, b"mmap", &t);
+    }
+    p
+}
+
+/// sceKernelMmap: as `mmap_probe`, op b'Y'.
+#[allow(non_snake_case)]
+pub(crate) unsafe extern "C" fn sceKernelMmap_probe(
+    addr: *mut c_void,
+    len: usize,
+    prot: c_int,
+    flags: c_int,
+    fd: c_int,
+    off: sys::off_t,
+    res: *mut *mut c_void,
+) -> c_int {
+    let seen = unsafe { map_path(flags, fd) };
+    let rc = unsafe { kernel_slot::<SceMmapFn>(sys::hook::sceKernelMmap) }
+        .map_or(sys::SCE_KERNEL_ERROR_EIO, |f| unsafe {
+            f(addr, len, prot, flags, fd, off, res)
+        });
+    if let Some(t) = seen {
+        event_text(b'Y', HOW_VIRTUAL, rc.into(), b"sceKernelMmap", &t);
+    }
+    rc
+}
+
 // ---- path calls ---------------------------------------------------------------
 
 /// Lookup letter and text of a path call worth logging: a path relative to
@@ -277,7 +371,55 @@ unsafe fn note_path(op: u8, dirfd: c_int, path: *const c_char, rc: i64) {
     }
 }
 
+/// `int openat(int, const char *, int, ...)`: the variadic mode arrives in
+/// the fourth integer register on SysV x86-64 (as `underscore_openat_emul`
+/// in rt/index.rs declares it).
+type OpenatFn = unsafe extern "C" fn(c_int, *const c_char, c_int, ...) -> c_int;
+type FstatatFn = unsafe extern "C" fn(c_int, *const c_char, *mut c_void, c_int) -> c_int;
+type FaccessatFn = unsafe extern "C" fn(c_int, *const c_char, c_int, c_int) -> c_int;
 type ReadlinkFn = unsafe extern "C" fn(*const c_char, *mut c_char, usize) -> isize;
+
+pub(crate) unsafe extern "C" fn openat_probe(
+    dirfd: c_int,
+    path: *const c_char,
+    flags: c_int,
+    mode: c_int,
+) -> c_int {
+    let rc = unsafe { kernel_slot::<OpenatFn>(sys::hook::openat) }
+        .map_or_else(posix_missing_original, |f| unsafe {
+            f(dirfd, path, flags, mode)
+        });
+    unsafe { note_path(b'T', dirfd, path, rc.into()) };
+    rc
+}
+
+pub(crate) unsafe extern "C" fn fstatat_probe(
+    dirfd: c_int,
+    path: *const c_char,
+    sb: *mut c_void,
+    flag: c_int,
+) -> c_int {
+    let rc = unsafe { kernel_slot::<FstatatFn>(sys::hook::fstatat) }
+        .map_or_else(posix_missing_original, |f| unsafe {
+            f(dirfd, path, sb, flag)
+        });
+    unsafe { note_path(b'F', dirfd, path, rc.into()) };
+    rc
+}
+
+pub(crate) unsafe extern "C" fn faccessat_probe(
+    dirfd: c_int,
+    path: *const c_char,
+    mode: c_int,
+    flag: c_int,
+) -> c_int {
+    let rc = unsafe { kernel_slot::<FaccessatFn>(sys::hook::faccessat) }
+        .map_or_else(posix_missing_original, |f| unsafe {
+            f(dirfd, path, mode, flag)
+        });
+    unsafe { note_path(b'C', dirfd, path, rc.into()) };
+    rc
+}
 
 pub(crate) unsafe extern "C" fn readlink_probe(
     path: *const c_char,
@@ -295,7 +437,7 @@ pub(crate) unsafe extern "C" fn readlink_probe(
 const AT_FDCWD: c_int = -100;
 
 /// Logs `op` with the result `rc` of a pass-through libc path call (`_open`,
-/// `_openat`, `access`, `lstat` whose `AMPR_ZSTD_LIBC_HOOKS` bit is off)
+/// `_openat`, `access`, `lstat` whose `AMPR_PACK_LIBC_HOOKS` bit is off)
 /// already made on `path`, when `path` is a packed file or indexed directory.
 pub(crate) unsafe fn probe_path(path: *const c_char, op: u8, rc: c_int) {
     if let Some(how) = unsafe { probe_packed_path(path) } {

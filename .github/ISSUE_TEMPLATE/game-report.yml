@@ -22,8 +22,8 @@ body:
     id: version
     attributes:
       label: ampr-emu-ng version
-      description: 'The launch notification shows it, e.g. "ampr-emu-ng: v0.5.4 (zstd) running" or, for a beta, "v0.5.4-beta.abc1234". For a test build, name the zip.'
-      placeholder: "v0.5.4"
+      description: 'The launch notification shows it, e.g. "ampr-emu-ng: v0.5.0 (zstd) running" or, for a beta, "v0.5.0-beta.abc1234". For a test build, name the zip.'
+      placeholder: "v0.5.0"
     validations:
       required: true
 
@@ -43,7 +43,6 @@ body:
       label: Packs
       description: The mode in the launch notification.
       options:
-        - pkg (kraken-mount)
         - zstd
         - lz4
         - plain (no packs)
@@ -72,9 +71,9 @@ body:
       description: Firmware, loader and its version, packer and its version, install type and storage.
       value: |
         Firmware:
-        Loader (e.g. kraken-mount x.y or ShadowMountPlus x.y), fakelib updates off: yes/no
+        Loader (e.g. ShadowMountPlus x.y), fakelib updates off: yes/no
         Packer (e.g. ps5-dump-forge x.y):
-        Install: folder / ffpkg / pkg (kraken-mount)
+        Install: folder / ffpkg / pkg
         Storage: internal SSD / extended M.2 / USB exFAT
     validations:
       required: true
@@ -103,12 +102,6 @@ body:
           curl http://<ps5-ip>:9090/metrics > metrics.txt
           curl http://<ps5-ip>:9090/fsfail  > fsfail.txt
           curl http://<ps5-ip>:9090/modules > modules.txt
-
-        Any build: attach /data/ampr_emu_status.txt (rewritten at each start: version,
-        mode, hooks that did not install). If it is older than the launch, ng never loaded.
-
-        kraken-mount: attach /data/krakenmount/kraken.log (the "[launch ...]" lines show
-        whether the overlay was mounted in time).
 
         "Something went wrong" right at launch: also attach /data/shadowmount/debug.log.
         If ampr_emu_trace.txt did not change, the runtime never loaded.
