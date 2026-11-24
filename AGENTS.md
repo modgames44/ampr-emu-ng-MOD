@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Notes for coding agents working on ampr-emu-ng (version 0.5.0, GPL-3.0-or-later).
+Notes for coding agents working on ampr-emu-ng (version 0.5.1, GPL-3.0-or-later).
 
 ## Project
 
@@ -122,7 +122,8 @@ an LZ4 or pkg title's `ampr_assets.index.runtime` profile can ask for up to 16,
 `AMPR_EMU_PACK_WORKER_CAPACITY`; the worker start cuts workers until
 each has a pipeline in the Buffer ledger, 9 and 9 at 16, `buffer_split`
 in `rt/pack/worker.rs`),
-and 6 disk read threads (`tune::RELEASE_PREAD_THREADS`). A packed POSIX
+and 8 disk read threads (`tune::RELEASE_PREAD_THREADS`, 6 before lane EOP
+overlap; below). A packed POSIX
 read (read, pread, readv, preadv, libc `_read`/`_readv` on a virtual pack
 fd) queues its pack jobs and waits on the caller's own thread
 (`read_on_workers` in `rt/pack/fd_read.rs`); there are no fd read threads.
@@ -141,7 +142,7 @@ up to 128 KiB a stack; the slot is freed after `scePthreadJoin` (a wrapper
 in `rt/reactor/mod.rs`). A larger stack, a full block or a missing or
 refused `scePthreadAttrSetstack` falls back to libkernel's stack.
 A runtime thread, once started, stays: threads start when work queues,
-up to the group caps (reactor, 4 decode workers, 6 pool threads: 11, 12
+up to the group caps (reactor, 4 decode workers, 8 pool threads: 13, 14
 with the debug metrics thread), and leave only under pressure (load
 retirement was removed, see "Removed"). That EAGAIN starts pressure mode: idle threads leave at once, each group runs at most
 one thread while it has work and none without (decode workers never go
@@ -166,23 +167,20 @@ upstream. The
 runtime creates its own threads through `create_internal`
 (the pre-detour slot). Save data (`rt/save.rs`) is hooked by NID in a
 loaded `libSceSaveData` module, not through the libkernel table, in every
-title (the loader observer finds it outside `sceKernelGetModuleList`), 4
-hooks: `sceSaveDataSaveIconByPath` hands a packed icon to
+title (the loader observer finds it outside `sceKernelGetModuleList`), 3
+hooks: `sceSaveDataSaveIconByPath` hands a packed icon, or a loose one
+whose path the service refuses (0x809f000e, pkg mode), to
 `sceSaveDataSaveIcon` as bytes in a game libc heap buffer of its size,
 freed after the call (the save service cannot open a packed path, and a
-path to a decoded copy under /data/ampr_cache hung the service call);
-`sceSaveDataMount3` answers a BUSY mount of a directory the game already
-has mounted with that mount's point (same blocks and systemBlocks, and
-never a read-only point to a mount that writes), and
-`sceSaveDataUmount2` counts its owners, so only the last owner's unmount reaches the service. An
-interrupted save left a slot the game kept mounted and mounted again: BUSY
-there hung the load forever when passed back, and unmounting the game's
-other points instead made another title hang on close. A creating
+path to a decoded copy under /data/ampr_cache hung the service call;
+`sceSaveDataSaveIcon` passes through, hooked only for its original entry),
+and a creating
 `sceSaveDataMount3` the library refuses (0x809F0000) with a nonzero
 systemBlocks is sent once more with systemBlocks 0: below SDK 5.00 the
 library takes only 0, and a title backported to 4.xx still passes the -1
-of its own SDK, so it never saved. Every other mount and unmount passes
-through. The debug build adds pass-through probes on 13
+of its own SDK, so it never saved. Every other mount, BUSY included,
+passes through, as does every unmount (shared save mounts are under
+"Removed"). The debug build adds pass-through probes on 14
 more save and dialog calls (`probe` in `rt/save.rs`, `fs V` lines).
 CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag creates a draft release with both `.sprx` and `SHA256SUMS`.
 
@@ -202,8 +200,8 @@ CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag cre
   bump top reached 246,688 B on a console; `realloc` grows or shrinks
   the last block in place) and
   falls back to the game's libc heap only past it (debug `heap_libc_bytes`).
-  The one other use of the game's libc heap is a packed save icon
-  (`read_packed` in `rt/save.rs`): a buffer of the icon's size for the
+  The one other use of the game's libc heap is a save icon handed over as
+  bytes (`read_icon` in `rt/save.rs`): a buffer of the icon's size for the
   one sceSaveDataSaveIcon call, freed when it returns (551,096 B on one
   title; a failed malloc skips the icon). Keep it to these two; zstd decoders use a static DCtx
   in a pool workspace (`ZstdDecoder::init_in` in `crates/ampr-codec`).
@@ -214,7 +212,7 @@ CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag cre
   decoder workspaces, one per live zstd worker, taken at its start and
   freed when it retires), and Cache, the rest of the pool
   (`CACHE_MEMORY_MAX` = pool - Index - Buffer - sites budget - stack
-  block, rounded down to 16 KiB; 32.00 MiB release, 30.64 MiB debug).
+  block, rounded down to 16 KiB; 32.00 MiB release, 30.61 MiB debug).
   The cache is one decoded chunk cache carved at the pack mount and carved
   again, still empty, once the index view is finished: the Index cap's idle
   room above 2 MiB (`INDEX_KEPT_ROOM`, 4 MiB before) moves to the Cache cap and the cache
@@ -224,7 +222,9 @@ CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag cre
   that kept room; its two uses are the 64 KiB getdents listing window
   (`take_listing_window` in `rt/pack/directories.rs`, taken once on the
   first listing of a packed directory when names are read from the kept
-  fd, and only while 64 KiB of room is left) and the debug /bench buffer.
+  fd or when a physical getdents fails EINVAL on a caller buffer below the
+  filesystem's block size, and only while 64 KiB of room is left) and the
+  debug /bench buffer.
   The cache holds at most 16384 entries (`AMPR_EMU_PACK_CACHE_ENTRY_CAP`
   in `rt/pack/mod.rs`, 8192 before, 56 B each in .bss outside the pool;
   debug `cache_cap_evictions` counts the evictions the cap forces while
@@ -245,9 +245,9 @@ CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag cre
   caps plus a 32 MiB cache, 144.19 MiB (`AMPR_INTERNAL_POOL_SIZE`
   `0x9030000`), and both PRX builds load to its total, 150.89 MiB (PT_LOAD
   memsz), within a 16 KiB page, with no padding: the debug pool is
-  142.83 MiB (`AMPR_DEBUG_POOL_SIZE` `0x8ED4000`), the gap being the debug
-  build's larger non-pool part (8.06 vs 6.70 MiB; totals 158,221,826 and
-  158,219,474 B, 2,352 B apart, from `dist`). Against the 192 MiB pool it
+  142.80 MiB (`AMPR_DEBUG_POOL_SIZE` `0x8ECC000`), the gap being the debug
+  build's larger non-pool part (8.10 vs 6.70 MiB; totals 158,216,250 and
+  158,230,122 B, 13,872 B apart, from `dist`). Against the 192 MiB pool it
   lost no game wait per read on three titles (debug /metrics, one run
   each; Makefile comment). `dist` fails when the two totals differ by more than 64 KiB or
   exceed 256 MiB (`PRX_TOTAL_LIMIT` in `tools/verify_payload_prx.py
@@ -340,7 +340,7 @@ CI (`.github/workflows/build.yml`) runs the same commands; a pushed `v*` tag cre
    stacks; v0.4.0 overflowed a save thread's), and when any function in
    the PRX has a frame of 16 KiB (0x4000) or more, a guard page's size
    (no stack probes). It also sums four chains
-   against 0x1000 each: the packed open (0xcc8 release, 0x940 debug), the
+   against 0x1000 each: the packed open (0x878 release, 0x878 debug), the
    packed POSIX read on the caller's thread (`READ_CHAIN`, 0x720 release,
    0x720 debug), and the save icon's packed read under the icon hook
    (`ICON_READ_CHAIN`, 0xb78 release, 0x7e8 debug), and the module loader
@@ -393,9 +393,6 @@ that needs the icon hook hung on its first save.
   `ra_gate`). Off by default; with the pread pool it gave 1.62 vs 1.60 ms
   per read, a worst read of 36.2 vs 26.7 ms, and on a second title doubled
   disk bytes (1.69 vs 0.78 per game byte).
-- Lane EOP overlap (`rt/reactor/lane_overlap.rs`, 612 lines, knob
-  `lane_eop_overlap`). Off in both builds; 7.7 vs 6.1 ms per job at 32
-  pread threads on loose files.
 - Equeue user-space local wait (knob `equeue_local`). Off in both builds;
   when on it missed native events from paths the overlay does not hook.
   Queue tracking stays.
@@ -424,7 +421,7 @@ titles and a zstd title against v0.4.1 with no regression:
   path never ran on a console. A map of a packed file now fails. Stays:
   the debug probes on ids 96 and 97 (`mmap_probe` in `rt/probe.rs`, op
   letters X and Y, `mmap_virtual`), the module_start removal of an old
-  /data/ampr_cache, and `read_packed`, moved to `rt/save.rs`. The 256 KiB
+  /data/ampr_cache, and `read_packed` (now `read_icon`), moved to `rt/save.rs`. The 256 KiB
   went to the cache (fixed sites budget 2 to 1.75 MiB).
 - Loose read classes (`AmprLooseReadClass`, `readClass`, `classActive`,
   the latency escape slots and the class admission limit in the
@@ -473,6 +470,128 @@ titles and a zstd title against v0.4.1 with no regression:
   264 us; with the ladder back it measured 259 us. On a pkg title with
   1.3 ms pack jobs it changed nothing measurable. Reads that finish in
   tens of us need the short first poll.
+
+Brought back after v0.5.0: lane EOP overlap (`rt/reactor/lane_overlap.rs`,
+removed in the 256 MiB change on a loose-file run, 7.7 vs 6.1 ms per job
+at 32 pread threads). A priority lane ran one command buffer at a time:
+the next one's first read waited for the head's last read and its
+completion write. With overlap the next buffer parses and issues its
+reads while the head has only completion commands left; completions
+still publish in lane order. It is on in release; the debug knob
+`lane_eop_overlap` defaults to 1. Console, debug, one run each at equal
+reads, a command buffer from submit to release (`job_total_ns`,
+`rt/reactor/job_state.rs` `stat_released`), off against on: a zstd title
+97.9 vs 5.3 ms (first read issued after 97.5 vs 1.5 ms), two pkg titles
+6.09 vs 5.51 and 9.78 vs 8.90 ms. Game wait per read rises meanwhile
+(0.42 to 1.93 ms on the zstd title, more reads in flight at once), so
+compare builds on `job_total_ns`, not on wait per read: that number runs
+from the reactor's submit of a read and never saw the lane wait. With
+overlap the pread pool queues, so it went from 6 to 8 threads: on the
+zstd title 5.44 ms a command buffer at 6, 4.10 at 8, 4.32 at 12 (pool
+queue wait 492, 308 and 195 us); that title had one failed game thread
+creation at 8 and at 12, none at 6. The earlier "16 threads, no gain"
+runs were measured while a lane let one or two reads through. A lane
+keeps completion order because the console's own front end does (FIFO
+inside one priority) and a lane's command buffers share gather/scatter
+and counter state; on the zstd title a job waits 1.2-1.3 ms for the jobs
+ahead of it to publish, a cache hit behind earlier misses.
+
+Removed after v0.5.0, by the owner's decision from console runs:
+
+- Shared save mounts (the `sceSaveDataUmount2` hook, the mounted-points
+  table, the pass-through unmount log and the BUSY retry in
+  `sceSaveDataMount3`, metrics `save_mounts_shared` and
+  `save_umounts_shared`). A BUSY mount of a directory the title held was
+  answered with the held point and the owners counted. It only rescued a
+  slot left by an interrupted save, which loads once and heals on the next
+  save: the game keeps the slot mounted (mode 0x1) and mounts it again
+  (0x21), BUSY, and never retries. Every such slot seen was made by a
+  build without the icon hook (save hung at the icon, game killed). On a
+  title whose threads race for one directory, each mount prepared for a
+  transaction, the share swallowed the first owner's unmount, its update
+  never ended and closing the game timed out suspending it. The mode check
+  added for writing mounts already kept v0.5.0 from sharing the 0x21
+  mount. Console, one zstd title, debug, slot broken that way: v0.5.0
+  hung on load (save_busy 1, shared 0); the old share build loaded it
+  (5 shared) and its save healed the slot. A slot broken by a crash
+  mid-save now hangs that load, as retail would. The BUSY retry went with
+  it: retail passes BUSY back, and the titles seen retry it themselves.
+- One disk read per split read (debug knob `shared_split_read`, never
+  committed): child 0 of a split read extended its exact run over its
+  siblings' chunks, the siblings parked instead of reading, and each got
+  its stored bytes copied into its own window when the read landed, so
+  the decodes stayed on separate workers. Tried and dropped. Console, one
+  pkg title, debug, lane EOP overlap on and 12 pool threads, one run each
+  at equal reads: disk reads per game read 1.54 to 0.82 (116 to 220 KiB
+  each), 31,284 siblings served and 3,140 sent back to read alone, no
+  error, decode step 338 vs 349 us; but a disk read took 2,583 vs 2,180
+  us, a pack job 3,253 vs 2,611 us and a command buffer, submit to
+  release, 5.55 vs 5.04 ms (+10%). The flat cost of a disk read (4K to
+  512K) was measured with 1-2 reads in flight; with a dozen in flight a
+  read's time grows with its size, and every sibling waits for the one
+  larger read. Not repeated, so disk noise is not ruled out.
+- zstd's assembly Huffman loop (`huf_decompress_amd64.S`, built by adding
+  `-D__linux__` to `ZSTD_CFLAGS`, since `portability_macros.h` enables it
+  only for Linux, macOS and Windows; never committed). The loop linked
+  (`HUF_decompress4X1_usingDTable_internal_fast_asm_loop` in the PRX) and
+  changed nothing: console, one zstd title, debug, one run each at equal
+  reads, decode per 256 KiB chunk 314.6 us with it against 311.8 us
+  without (110,789 and 111,598 decodes). The C loop stays.
+- Ghost-list cache admission (debug knob `cache_ghost_admit`, a 128 KiB
+  table of evicted chunk keys; local branch `exp/ghost-list`): a miss on a
+  chunk evicted less than one cache size ago was cached at once as
+  protected. Tried again with lane EOP overlap on and 8 pool threads and
+  dropped. Console, one zstd title, debug, one run each at equal reads:
+  hit rate 62.8 to 64.0%, disk reads 110,551 to 106,157 (-4%), and a
+  command buffer, submit to release, 3.94 vs 4.06 ms: no gain past run
+  noise. On two pkg titles under 1.5% of misses were such ghosts.
+- A change to the Kraken decoder's Huffman stage (two arrays in one
+  loop), not written. The phase counters (`phase_timing` in ampr-pkg) on
+  a console, one pkg title, 53,651 chunks of 419 us: Huffman arrays 39.6%
+  of decode (literals 25.7, commands 6.4, offsets and lengths 7.5), the
+  command loops 60.5% (delta literals 42.2, plain 18.3). An estimated
+  25-40% off the Huffman stage is 40-65 us a chunk, about 1% of a 5.3 ms
+  command buffer, and the repo has no Kraken data to check a decoder
+  change against.
+- A larger reactor pass budget (`read_chunk_quantum` 32 and
+  `read_pass_kib` 2048 against 8 and 512, debug knobs, no code change):
+  a lane may issue 32 one-read jobs a pass instead of 8. Console, one
+  zstd title, lane EOP overlap on, 8 pool threads, one run each at equal
+  reads: `read_budget_held` 1,905 to 65, but a command buffer took 4.63
+  vs 3.93 ms and its first read was issued after 1.60 vs 1.21 ms. The
+  defaults stay.
+- Completions out of lane order, not built. A job whose reads are done
+  waits for the jobs ahead of it to publish (1.2-1.3 ms a job on a zstd
+  title with overlap on, about a third of its time). The console's own
+  front end keeps FIFO order inside one priority (upstream models it so,
+  and keeps publication FIFO under its cross-job read-ahead), a lane's
+  command buffers share gather/scatter and counter state, and a game that
+  takes "the last one is done" for "all are done" would read a buffer not
+  filled yet: a silent failure no test run rules out.
+- 12 pool threads against 8: equal on a zstd title (4.32 vs 4.10 ms a
+  command buffer), one failed game thread creation at each; the owner
+  set the cap to 8.
+
+Tried before lane EOP overlap and not shipped, console, debug, one run
+each (measured while a lane let one or two reads through, so thread and
+disk results may differ now):
+
+- O_DIRECT on pack reads: honoured, no faster (equal at 4K and 64K,
+  slower at 256K: 565 vs 660 MB/s on one thread).
+- Kernel AIO in place of the pread pool: within noise on two pkg titles,
+  31% slower on a zstd title (414 vs 316 us per read); a waiter thread
+  in `sceKernelAioWaitRequests` cut that to +8.5%.
+- 16 pool threads and 16 pipelines, and 1 decode worker with 1-2 pool
+  threads: no gain on five titles; the single worker was slower (1,645
+  and 1,926 vs 1,446-1,550 us per read on a pkg title).
+- Thread placement (game I/O threads at priority 512, runtime threads on
+  all cores, a picked set of 4 quiet cores): nothing past disk noise on
+  two pkg titles.
+- Two chunks in one pack job (no split below 3 chunks): disk reads per
+  read 1.32 to 0.77 on a pkg title, but the two decodes ran one after
+  the other and game wait rose 1,387 to 1,523 us.
+- A compressed chunk cache: hit rate 65.5 to 70.7% on a zstd title, but
+  every hit decodes (248 us) and game wait rose 290 to 442 us.
 
 ## Do not commit
 

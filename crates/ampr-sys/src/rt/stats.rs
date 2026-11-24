@@ -164,26 +164,23 @@ stats! {
     LibcPacked93 = "libc_packed_93",
     LibcPacked94 = "libc_packed_94",
     LibcPacked95 = "libc_packed_95",
-    /// Save data icon (rt/save.rs): bytes of packed icons handed over through
-    /// sceSaveDataSaveIcon, and packed icons the runtime could not read or
-    /// the service refused (the call then answers 0: the icon is cosmetic,
-    /// the error stalled a save).
+    /// Save data icon (rt/save.rs): bytes of icons handed over through
+    /// sceSaveDataSaveIcon (packed ones, and loose ones whose path the
+    /// service refused with 0x809f000e), and such icons the runtime could
+    /// not read or the service refused (the call then answers 0: the icon
+    /// is cosmetic, the error stalled a save).
     SaveIconBytes = "save_icon_bytes",
     SaveIconSkipped = "save_icon_skipped",
-    /// What sceSaveDataSaveIcon answered the last packed icon handed over,
-    /// before the hook maps a failure to 0, and the last call forwarded
-    /// unchanged (a loose or missing icon). Set, not summed, and printed as
+    /// What sceSaveDataSaveIcon answered the last icon handed over as bytes,
+    /// before the hook maps a failure to 0, and what the service answered
+    /// the last path forwarded (a loose or missing icon). Set, not summed, and printed as
     /// hex on /metrics (`is_code`); 0 there is also "no such call yet".
     SaveIconLastResult = "save_icon_last_result",
     SaveIconPathLastResult = "save_icon_path_last_result",
-    /// sceSaveDataMount3 (rt/save.rs): mounts, BUSY answers, BUSY mounts of
-    /// a directory this title already had mounted that were answered with
-    /// that point instead (a second owner), and unmounts of a shared point
-    /// answered without unmounting (an owner left).
+    /// sceSaveDataMount3 (rt/save.rs): mounts and BUSY answers, passed back
+    /// to the game.
     SaveMounts = "save_mounts",
     SaveBusy = "save_busy",
-    SaveMountsShared = "save_mounts_shared",
-    SaveUmountsShared = "save_umounts_shared",
     /// Creating sceSaveDataMount3 calls the library refused (0x809F0000)
     /// that were sent again with systemBlocks 0 (rt/save.rs MOUNT3_BYTES).
     SaveSystemBlocksZeroed = "save_system_blocks_zeroed",
@@ -344,6 +341,14 @@ stats! {
     /// reactor's own share (reactor/progress.rs note_successor_order_wait).
     JobOrderWaits = "job_order_waits",
     JobOrderWaitNs = "job_order_wait_ns",
+    /// Submit accept to release of one command buffer, lane wait included:
+    /// what the game waits for a job (reactor/job_state.rs stat_released).
+    JobTotals = "job_totals",
+    JobTotalNs = "job_total_ns",
+    JobTotalNsMax = "job_total_ns_max",
+    /// Completion commands of a head that lane EOP overlap let the
+    /// successor run past, counted once per job (reactor/lane_overlap.rs).
+    EopDeferred = "eop_deferred",
     /// Lane loop (reactor/progress.rs) stops before a job that has a
     /// successor queued in its priority lane, so the successor does not parse
     /// in this pass. Counted once per stop (per lane pass), by what the head
@@ -484,6 +489,7 @@ fn resets_on_read(s: usize) -> bool {
         || s == Stat::PreadReadNsMax as usize
         || s == Stat::PreadPendingMax as usize
         || s == Stat::JobFirstIssueNsMax as usize
+        || s == Stat::JobTotalNsMax as usize
         || s == Stat::JobNotifyNsMax as usize
         || s == Stat::PosixReadNsMax as usize
 }

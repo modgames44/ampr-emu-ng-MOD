@@ -1,15 +1,18 @@
 //! Lane EOP overlap: lets a priority lane's next job parse while the head job
-//! has only completion commands left (debug knob `lane_eop_overlap`, release
-//! constant AMPR_EMU_APR_LANE_EOP_OVERLAP = false).
+//! has only completion commands left. On in release; the debug build reads
+//! `lane_eop_overlap` (default 1).
 //!
 //! Why: the lane loop (progress.rs) parses a successor only once the head has
 //! consumed its whole source. A head whose last read is in flight parks on its
 //! EOP (address write, counter, equeue) at the read fence (native.rs
 //! progress_native_or_address_command), so the successor's first read waits a
-//! full read time. Console, a game, loose files, debug build with the
-//! pread pool and 64 KiB split (loose_pread.rs): ~15.6k jobs and
-//! ~24.5k reads per session, submit -> first read issued 4.3-4.8 ms per job vs
-//! 1.1 ms per read, 2-3 reads in flight per 1 s scrape = active lanes.
+//! full read time and a lane runs one command buffer at a time. Console,
+//! debug, one run each at equal reads, a command buffer from submit to
+//! release (`job_total_ns`), off against on: a zstd title 97.9 vs 5.3 ms
+//! (first read issued after 97.5 vs 1.5 ms, 982,578 vs 271 lane stops on the
+//! fence), two pkg titles 6.09 vs 5.51 and 9.78 vs 8.90 ms. Wait per read
+//! rises meanwhile (0.42 to 1.93 ms on the zstd title): more reads are in
+//! flight at once.
 //!
 //! Rule: the head qualifies when it has not failed, has no non-batch native
 //! micro op in flight, and every command left in its source is a completion
@@ -27,6 +30,7 @@
 //! has no command that reads or writes it (checked by decoding the tail once).
 
 use super::*;
+use super::progress::{lane_block_kind, lane_completion_signals, LaneBlock};
 use crate::rt::stats::{self, Stat};
 
 // ---- tail classification ----
@@ -47,12 +51,6 @@ pub(crate) fn lane_completion_op(op: &Op) -> bool {
         | WRITE_ADDRESS_FROM_COUNTER_PAIR => !AprAioReactor::software_op_is_sop(op),
         _ => false,
     }
-}
-
-/// Completion commands that signal the game (lane_completion_op minus nops
-/// and markers); the unit of the eop_deferred stat.
-pub(crate) fn lane_completion_signals(op: &Op) -> bool {
-    lane_completion_op(op) && !AprAioReactor::software_op_is_marker_or_nop(op.op_type)
 }
 
 /// Decodes the packed APR commands in `src[offset..]` once. Some(signals) when
@@ -111,79 +109,15 @@ pub(crate) fn overlap_successor_op_allowed(t: OpType) -> bool {
 /// Lane loop (progress.rs): after the head is released in a pass, go on to
 /// its successor in the same pass instead of the next reactor iteration.
 /// Without it a run of overlapped jobs whose reads are done publishes one job
-/// per reactor iteration. Release: the knob is the constant false.
+/// per reactor iteration.
 #[inline(always)]
 pub(crate) fn lane_release_cascades() -> bool {
     crate::rt::tune::lane_eop_overlap()
 }
 
-// ---- lane block diagnostics ----
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum LaneBlock {
-    Fence,
-    Wait,
-    Other,
-}
-
-/// Why a head with source left stops its lane: `cursorOp` is the decoded
-/// command parked at its source cursor (None if not cached), `fencePending`
-/// whether its own reads or a deferred native EOP are still outstanding.
-pub(crate) fn lane_block_kind(cursorOp: Option<&Op>, fencePending: bool) -> LaneBlock {
-    match cursorOp {
-        Some(op) if matches!(op.op_type, WAIT_ON_ADDRESS | WAIT_ON_COUNTER) => LaneBlock::Wait,
-        Some(op) if fencePending && lane_completion_signals(op) => LaneBlock::Fence,
-        _ => LaneBlock::Other,
-    }
-}
-
-pub(crate) fn note_lane_block(kind: LaneBlock) {
-    let s = match kind {
-        LaneBlock::Fence => Stat::LaneSuccessorBlockedFence,
-        LaneBlock::Wait => Stat::LaneSuccessorBlockedWait,
-        LaneBlock::Other => Stat::LaneSuccessorBlockedOther,
-    };
-    stats::add(s, 1);
-}
-
 // ---- reactor glue (progress.rs lane loop) ----
 
 impl AprAioReactor {
-    /// The decoded command parked at the job's source cursor, if cached.
-    fn lane_cursor_op(j: &JobState) -> Option<&Op> {
-        (j.decodedOpCacheBytes != 0 && j.decodedOpCache.buf_offset_bytes == j.sourceOffset)
-            .then_some(&j.decodedOpCache)
-    }
-
-    /// mem_report: the head before `succ` is being released. If `succ`'s
-    /// reads are all done and it is parked on a completion command, it was
-    /// held by lane order since its last read finished: job_order_wait_ns.
-    /// Its job_notify_ns span keeps running (statReadDoneNs is not taken).
-    pub(crate) fn note_successor_order_wait(succ: &JobState) {
-        #[cfg(feature = "mem_report")]
-        let start = succ.statReadDoneNs;
-        #[cfg(not(feature = "mem_report"))]
-        let start = 0u64;
-        if start != 0
-            && !Self::job_failed(succ)
-            && !Self::job_has_outstanding_reads(succ)
-            && Self::lane_cursor_op(succ).is_some_and(lane_completion_signals)
-        {
-            stats::add(Stat::JobOrderWaits, 1);
-            stats::add(Stat::JobOrderWaitNs, stats::since(start));
-        }
-    }
-
-    /// Records why the lane loop stops before `j`'s queued successor.
-    pub(crate) fn note_lane_successor_blocked(j: &JobState) {
-        if !crate::rt::tune::ON {
-            return;
-        }
-        let fencePending =
-            j.completedReadSeq < j.latestSubmittedReadSeq || j.nativeBatchReleasePending;
-        note_lane_block(lane_block_kind(Self::lane_cursor_op(j), fencePending));
-    }
-
     /// Lane loop: may `j`'s successor parse although `j` has source left?
     /// True only with `lane_eop_overlap` on and a completion-only tail.
     pub(crate) fn lane_eop_overlap_allows(j: &mut JobState, nativeSubmitted: bool) -> bool {
@@ -210,7 +144,6 @@ impl AprAioReactor {
     /// one that cannot publish stops without advancing. Without this a tail
     /// of k commands takes k reactor passes, and the head is released (and
     /// the cascade reaches its successor) only after the last one.
-    /// Inlined so the release build (knob constant false) drops the call.
     #[inline(always)]
     pub(crate) fn lane_tail_runs_on(j: &JobState, op: &Op, advanced: bool) -> bool {
         if !crate::rt::tune::lane_eop_overlap()
@@ -221,22 +154,13 @@ impl AprAioReactor {
         {
             return false;
         }
-        #[cfg(feature = "mem_report")]
-        {
-            j.laneTailMark != 0 && j.laneTailCompletionOnly && j.sourceOffset >= j.laneTailMark - 1
-        }
-        #[cfg(not(feature = "mem_report"))]
-        {
-            false
-        }
+        j.laneTailMark != 0 && j.laneTailCompletionOnly && j.sourceOffset >= j.laneTailMark - 1
     }
 
     /// Decodes `j`'s remaining commands once per cursor position (cached in
-    /// laneTailMark, debug only) and counts eop_deferred the first time they
-    /// qualify. Release never calls it (the knob is the constant false).
+    /// laneTailMark) and counts eop_deferred the first time they qualify.
     fn job_tail_completion_only(j: &mut JobState) -> bool {
         let at = j.sourceOffset;
-        #[cfg(feature = "mem_report")]
         if j.laneTailMark != 0 {
             let markAt = j.laneTailMark - 1;
             if j.laneTailCompletionOnly && at >= markAt {
@@ -248,11 +172,8 @@ impl AprAioReactor {
         }
         let src = unsafe { core::slice::from_raw_parts(j.sourceBuffer, j.sourceBytes as usize) };
         let signals = completion_tail_signals(src, at);
-        #[cfg(feature = "mem_report")]
-        {
-            j.laneTailMark = at + 1;
-            j.laneTailCompletionOnly = signals.is_some();
-        }
+        j.laneTailMark = at + 1;
+        j.laneTailCompletionOnly = signals.is_some();
         if let Some(n) = signals {
             stats::add(Stat::EopDeferred, n as u64);
         }

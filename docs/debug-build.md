@@ -8,11 +8,11 @@ with it, then ship the release build.
 
 `./ps5/build-docker.sh` (`make dist`) builds both files. The debug one is
 `make AMPR_MEM_REPORT=1` (Cargo feature `mem_report`) with the pool set to
-`AMPR_DEBUG_POOL_SIZE` (`0x8ED4000`, 142.83 MiB); the release pool is
+`AMPR_DEBUG_POOL_SIZE` (`0x8ECC000`, 142.80 MiB); the release pool is
 `0x9030000` (144.19 MiB). The smaller pool offsets the larger debug code,
 so both PRX files load to 150.89 MiB (within a 16 KiB page) with the same
 Index and Buffer caps and thread limits. The decoded cache is the rest of
-the pool, so the debug cache is 1.36 MiB (about 4%) smaller: 30.64 vs
+the pool, so the debug cache is 1.39 MiB (about 4%) smaller: 30.61 vs
 32.00 MiB; debug cache numbers are that much conservative. Those are the
 sizes carved at the pack mount: once the index is built the cache grows
 into the Index ledger's idle room above 2 MiB (`cache_grown_bytes`, 76-80
@@ -117,10 +117,16 @@ Pack chunks are read with exact-size reads, the only read path: one disk
 read covers a chunk's stored bytes, adjacent chunks coalesced.
 `pack_disk_reads` counts those reads and `pack_disk_bytes` their bytes.
 Read bytes are not cached; decoded chunks go to the decoded cache, the
-Cache ledger (30.64 MiB in the debug build at the mount).
+Cache ledger (30.61 MiB in the debug build at the mount).
 
-Most runs compare three numbers:
+Most runs compare these numbers:
 
+- command buffer, submit to release: `job_total_ns / job_totals`. Compare
+  builds on this one: it includes the wait in the priority lane, which
+  game wait per read does not (it starts at the reactor's submit of a
+  read). `job_first_issue_ns / job_first_issues` is the part before the
+  first read is issued, `job_order_wait_ns / job_totals` the wait for
+  earlier jobs of the lane to publish;
 - game wait per read: `apr_read_ns / apr_reads`;
 - pack job (a packed read from submit to completion):
   `pack_job_ns / pack_jobs`;
@@ -250,10 +256,11 @@ curl 'http://<ps5-ip>:9090/set?read_chunk_quantum=8&pread_threads=4'
 ```
 
 `/set` applies the pairs in order and stops at the first bad one, then
-rewrites the file and lists every knob. Live knobs (pread pool switches,
+rewrites the file and lists every knob, so a knob set in one run stays
+set for every later launch of any title until the file is deleted. Live knobs (pread pool switches,
 reactor issue limits, thread budget,
 `spin_us`, `regrow_s`, `pread_wake_all`, `cache_protect_hits`,
-`cache_protect_pct`) apply from the next read or reactor
+`cache_protect_pct`, `lane_eop_overlap`) apply from the next read or reactor
 pass. `spin_us` (0..=200, release 100) is read at each idle wait of a pack
 worker and pread pool thread, so `/set?spin_us=50` or `100`
 takes effect at once; compare game wait per read and `pread_wakeups_idle`
@@ -263,7 +270,7 @@ pressure counters (`<group>_threads_live`, `_threads_peak`,
 `_retired_pressure`; `_target` is written only under pressure, 0 or 1,
 and reads 0 before the first pressure check). Startup knobs (`decoded_mib`, workers, pipelines, `pread_threads`,
 `zstd_verify`, `worker_stack_kib`) apply at the next launch. The tune file
-skips knobs that no longer exist (`ra`, `ra_gate`, `lane_eop_overlap`,
+skips knobs that no longer exist (`ra`, `ra_gate`,
 `equeue_local`, `retire_load`, `profile`); `/set` refuses them. A decoded
 cache past the Cache ledger (`decoded_mib` default 136, the cap rounded up)
 is cut to fit. The I/O windows
@@ -300,9 +307,9 @@ of `/metrics` and in the black box; the full list is at `FsEvents` in
 | `I` | The game's own AIO submit on a packed fd, served by the runtime (logged whatever the result). |
 | `X Y` | mmap, `sceKernelMmap` of a virtual fd, lookup `v`: the map failed (a packed file has no physical copy to map; the mmap disk cache was removed). Debug only, ids 96 and 97 are probes; `mmap_virtual` counts them. |
 | `Z` | A pack chunk failed to decode, or a zstd checksum mismatched. |
-| `U` | A failed `getdents` or `getdirentries` on a virtual directory fd, lookup `d`: path `read <directory> rc=0x<8 hex>`. Each distinct result of a directory is kept once, `/fsfail` counts the repeats. Lookup `x`: path `realfail <directory> errno=<n>`, the physical `getdents` behind the directory failed with `n`, so the listing goes on with the packed entries only. |
+| `U` | A failed `getdents` or `getdirentries` on a virtual directory fd, lookup `d`: path `read <directory> rc=0x<8 hex>`. Each distinct result of a directory is kept once, `/fsfail` counts the repeats. Lookup `x`: path `realfail <directory> errno=<n>`, the physical `getdents` behind the directory failed with `n`, so the listing goes on with the packed entries only. A first EINVAL (a caller buffer below the filesystem's block size) is not logged: the directory is read again through the 64 KiB listing window, and only a failure of that read logs `realfail`. |
 | `P` | A failed game thread creation: lookup `s` scePthreadCreate, `p` pthread_create, `r` its retry, `h` the `/threads` probe (black box only). |
-| `V` | Save data (`rt/save.rs`), lookup `-`: `save icon <path> rc=0x<8 hex>` for a packed icon handed over as bytes (`-1`: not read); `save <call> in` and `save <call> rc=0x<8 hex>` on entry to and return from each probed save or dialog call, so a call with an `in` and no answer is the one a game is stuck in; `save Mount3 arg` (the request's first 5 words: blocks, systemBlocks and the mode in the low half of the 5th), `dir`, `point` and `save Umount2 point` for the mounts; `save Umount2 shared` for an unmount of a shared point answered without unmounting; `save Mount3 systemBlocks 0 rc=0x<8 hex>` for a refused creating mount sent again with systemBlocks 0. Counters: `save_mounts`, `save_busy`, `save_mounts_shared`, `save_umounts_shared`, `save_system_blocks_zeroed`, `save_icon_bytes`, `save_icon_skipped`, and the answer codes `save_icon_last_result`, `save_icon_path_last_result` (hex). |
+| `V` | Save data (`rt/save.rs`), lookup `-`: `save icon <path> rc=0x<8 hex>` for an icon handed over as bytes, packed or a loose one whose path the service refused (`-1`: not read; that retry shows `save SaveIconByPath rc=0x809f000e`, the service's answer, before the hook's own); `save <call> in` and `save <call> rc=0x<8 hex>` on entry to and return from each probed save or dialog call, so a call with an `in` and no answer is the one a game is stuck in; `save Mount3 arg` (the request's first 5 words: blocks, systemBlocks and the mode in the low half of the 5th), `dir`, `point` and `save Umount2 point` for the mounts (debug probe), so a point mounted more often than unmounted shows; `save Mount3 systemBlocks 0 rc=0x<8 hex>` for a refused creating mount sent again with systemBlocks 0. Counters: `save_mounts`, `save_busy`, `save_system_blocks_zeroed`, `save_icon_bytes`, `save_icon_skipped`, and the answer codes `save_icon_last_result`, `save_icon_path_last_result` (hex). |
 | `Q` | Packed fd and open failures: `H` raw SCE error of a packed open, `R` errno of a physical open (`fs` ring only), `S` the 320-slot packed-fd table full. |
 
 Lookup letters of path hooks: `h` index hit, `m` miss the index answers,

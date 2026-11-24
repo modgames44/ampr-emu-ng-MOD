@@ -838,7 +838,7 @@ pub(crate) const AMPR_EMU_PACK_MAX_PACKS: usize = 1024;
 /// all 18 of the old cap busy (debug /metrics).
 pub(crate) const AMPR_EMU_PACK_OPEN_PACK_FD_CAP: u32 = 32;
 /// The whole Cache ledger, the pool's remainder (rt/index_memory.rs
-/// `CACHE_MEMORY_MAX`: 30.64 MiB debug, 32 MiB release at the mount, then
+/// `CACHE_MEMORY_MAX`: 30.61 MiB debug, 32 MiB release at the mount, then
 /// grown from the Index ledger; debug knob `decoded_mib`): the only pack
 /// cache, so the release cache is 1.36 MiB larger than the debug one. Exact reads with 64 MiB
 /// decoded gave 11-14% lower game wait per read than 32 + 32 MiB page reads
@@ -1008,6 +1008,13 @@ pub(crate) struct VirtualDirectorySlot {
     /// The physical `getdents` failed for good; the rest of the listing is
     /// the packed entries (directories.rs `directory_read_fd`).
     pub real_failed: bool,
+    /// The physical directory is read through the listing window, not the
+    /// caller's buffer (directories.rs `bounce_physical`): `bounce_offset`
+    /// is the directory offset of the batch being handed out and
+    /// `bounce_skip` the records of it already handed out.
+    pub physical_bounce: bool,
+    pub bounce_skip: u32,
+    pub bounce_offset: c_long,
     pub dot_emitted: bool,
     pub dot_dot_emitted: bool,
     pub physical_hash_overflow: bool,
@@ -1025,6 +1032,9 @@ impl VirtualDirectorySlot {
         active: false,
         real_exhausted: false,
         real_failed: false,
+        physical_bounce: false,
+        bounce_skip: 0,
+        bounce_offset: 0,
         dot_emitted: false,
         dot_dot_emitted: false,
         physical_hash_overflow: false,
